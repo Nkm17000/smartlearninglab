@@ -1,7 +1,9 @@
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 venv/
 .env
-.idea/
 .vscode/
+.idea/
+.pytest_cache/
+*.log
