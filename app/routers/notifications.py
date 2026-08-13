@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import get_current_user
-from app.schemas.notifications import NotificationCreate
-from app.services.notifications_service.py import NotificationService
+from app.schemas.notification import NotificationCreate
+from app.services.notification_service import NotificationService
 
 router = APIRouter()
 service = NotificationService()

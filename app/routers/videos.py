@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from app.core.dependencies import get_current_user, require_admin
-from app.schemas.videos import VideoCreate
-from app.services.videos_service.py import VideoService
+from app.schemas.video import VideoCreate
+from app.services.video_service import VideoService
 
 router = APIRouter()
 service = VideoService()

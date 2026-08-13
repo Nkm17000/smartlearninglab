@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from app.core.dependencies import get_current_user, require_admin
-from app.schemas.achievements import AchievementCreate
-from app.services.achievements_service.py import AchievementService
+from app.schemas.achievement import AchievementCreate
+from app.services.achievement_service import AchievementService
 
 router = APIRouter()
 service = AchievementService()

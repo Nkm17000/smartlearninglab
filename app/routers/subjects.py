@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from app.core.dependencies import get_current_user, require_admin
-from app.schemas.subjects import SubjectCreate
-from app.services.subjects_service.py import SubjectService
+from app.schemas.subject import SubjectCreate
+from app.services.subject_service import SubjectService
 
 router = APIRouter()
 service = SubjectService()

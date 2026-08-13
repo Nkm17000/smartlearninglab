@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from app.core.dependencies import get_current_user
-from app.schemas.bookmarks import BookmarkCreate
-from app.services.bookmarks_service.py import BookmarkService
+from app.schemas.bookmark import BookmarkCreate
+from app.services.bookmark_service import BookmarkService
 
 router = APIRouter()
 service = BookmarkService()
