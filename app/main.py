@@ -1,25 +1,70 @@
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.config import settings
-from app.database import ping_database, close_database
-from app.routers import auth,content,student,admin,health
+
+from app.core.config import get_settings
+from app.db.mongo import close, ping
+from app.routers import (
+    auth, exams, learning, questions, tests, progress,
+    current_affairs, personal, notifications, admin, ai
+)
+
+settings = get_settings()
+
 
 @asynccontextmanager
-async def lifespan(app):
-    ping_database()
+async def lifespan(app: FastAPI):
+    # Validate MongoDB connectivity when the server starts.
+    ping()
     yield
-    close_database()
+    close()
 
-app=FastAPI(title="Smart Learning Lab API",description="MongoDB-backed learning API",version="3.1.0",lifespan=lifespan)
-origins=["*"] if settings.cors_origins=="*" else [x.strip() for x in settings.cors_origins.split(",") if x.strip()]
-app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
-app.include_router(auth.router,prefix="/api/auth",tags=["Authentication"])
-app.include_router(content.router,prefix="/api",tags=["Learning Content"])
-app.include_router(student.router,prefix="/api",tags=["Student"])
-app.include_router(admin.router,prefix="/api/admin",tags=["Admin"])
-app.include_router(health.router,prefix="/api",tags=["Health"])
+
+app = FastAPI(
+    title=settings.app_name,
+    version="1.0.0",
+    description="Smart Learning Lab competitive-exam preparation backend",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+prefix = settings.api_prefix
+
+app.include_router(auth.router, prefix=prefix)
+app.include_router(exams.router, prefix=prefix)
+app.include_router(learning.router, prefix=prefix)
+app.include_router(questions.router, prefix=prefix)
+app.include_router(tests.router, prefix=prefix)
+app.include_router(progress.router, prefix=prefix)
+app.include_router(current_affairs.router, prefix=prefix)
+app.include_router(personal.router, prefix=prefix)
+app.include_router(notifications.router, prefix=prefix)
+app.include_router(ai.router, prefix=prefix)
+app.include_router(admin.router, prefix=prefix)
+
 
 @app.get("/")
 def root():
-    return {"status":"success","app":"Smart Learning Lab","version":"3.1.0","database":"MongoDB"}
+    return {
+        "name": settings.app_name,
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+def health():
+    try:
+        ping()
+        return {"status": "ok", "database": "connected"}
+    except Exception as exc:
+        return {"status": "degraded", "database": "disconnected", "error": str(exc)}
