@@ -10,9 +10,9 @@ quiz_attempts, student_progress, bookmarks, achievements, notifications.
 Create `.env` from `.env.example`.
 
 Example:
-MONGODB_URI=mongodb+srv://...
+MONGODB_URL=mongodb+srv://...
 MONGODB_DATABASE=smartlearninglab
-JWT_SECRET=use-a-long-random-secret
+JWT_SECRET_KEY=use-a-long-random-secret
 
 ## 2. Install
 python -m venv .venv

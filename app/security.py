@@ -26,11 +26,11 @@ def create_token(user_id, role):
     return jwt.encode(
         {"sub": str(user_id), "role": role, "exp": exp},
         settings.jwt_secret,
-        algorithm="HS256",
+        algorithm=settings.jwt_algorithm,
     )
 
 def decode_token(token):
     try:
-        return jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+        return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
