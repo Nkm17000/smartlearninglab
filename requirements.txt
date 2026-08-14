@@ -1,9 +1,8 @@
-fastapi
-uvicorn[standard]
-pymongo
-python-dotenv
-pydantic[email]
-pwdlib[argon2]
-PyJWT
-pytest
-httpx
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pymongo==4.17.0
+PyJWT==2.10.1
+pydantic==2.11.7
+pydantic-settings==2.10.1
+email-validator==2.2.0
+dnspython==2.7.0

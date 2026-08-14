@@ -1,10 +1,11 @@
 from fastapi import APIRouter
-
-router = APIRouter()
+from app.database import ping_database
+router=APIRouter()
 
 @router.get("/health")
 def health():
-    return {
-        "status": "success",
-        "message": "Smart Learning Lab backend is running"
-    }
+    try:
+        ping_database()
+        return {"status":"success","api":"up","database":"connected"}
+    except Exception as exc:
+        return {"status":"error","api":"up","database":"disconnected","detail":str(exc)}

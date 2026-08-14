@@ -1,97 +1,43 @@
-# Smart Learning Lab Backend
+# Smart Learning Lab — MongoDB Backend
 
-FastAPI + MongoDB backend for the Smart Learning Lab Android application.
+FastAPI backend for the React Native + Web Smart Learning Lab application.
 
-## Database
+MongoDB is the source of truth. The API reads the existing collections directly:
+users, courses, subjects, lessons, videos, quizzes, questions,
+quiz_attempts, student_progress, bookmarks, achievements, notifications.
 
-The application uses the existing MongoDB database:
+## 1. Configure
+Create `.env` from `.env.example`.
 
-smart_learning_lab
+Example:
+MONGODB_URI=mongodb+srv://...
+MONGODB_DATABASE=smartlearninglab
+JWT_SECRET=use-a-long-random-secret
 
-Expected collections:
-
-users
-courses
-subjects
-lessons
-videos
-quizzes
-questions
-quiz_attempts
-student_progress
-bookmarks
-achievements
-notifications
-
-## Setup
-
-Create a virtual environment:
-
+## 2. Install
 python -m venv .venv
-
-Windows:
-
-.venv\Scripts\activate
-
-Install dependencies:
-
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-Copy .env.example to .env and set the MongoDB Atlas connection string.
-
-Run:
-
+## 3. Run
 uvicorn app.main:app --reload
 
 Swagger:
+http://127.0.0.1:8000/docs
 
-http://localhost:8000/docs
+## 4. Optional sample data
+`scripts/seed_sample.py` only inserts sample documents when a collection has no
+documents. It does not delete your existing MongoDB data.
 
-Welcome:
+python scripts/seed_sample.py
 
-http://localhost:8000/
-
-Health:
-
-http://localhost:8000/api/health
-
-## Main API groups
-
-POST /api/auth/register
-POST /api/auth/login
-
-GET /api/users/me
-
-GET /api/courses
-GET /api/courses/{course_id}
-POST /api/courses
-
-GET /api/subjects
-GET /api/subjects/{item_id}
-
-GET /api/lessons
-GET /api/lessons/{lesson_id}
-
-GET /api/videos
-GET /api/videos/{item_id}
-
-GET /api/quizzes/{quiz_id}
-POST /api/quizzes/{quiz_id}/submit
-
-GET /api/progress/{course_id}
-POST /api/progress/{course_id}/lessons
-
-GET /api/bookmarks
-POST /api/bookmarks
-
-GET /api/achievements
-POST /api/achievements
-
-GET /api/notifications
-POST /api/notifications
+Demo accounts created by the sample script:
+student@smartlearninglab.com / Student@12345
+admin@smartlearninglab.com / Admin@12345
 
 ## Important
+Do NOT put MONGODB_URI in the React Native app. Only the FastAPI backend connects
+to MongoDB.
 
-The .env file is ignored by Git. Do not commit MongoDB passwords or JWT secrets.
-
-Quiz questions returned to the Android client do not include correct_answer before submission.
+For Render, set MONGODB_URI, MONGODB_DATABASE and JWT_SECRET as environment
+variables in the Render service.

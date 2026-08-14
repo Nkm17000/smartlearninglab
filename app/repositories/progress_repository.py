@@ -1,26 +1,16 @@
-from app.database import student_progress_collection
+from app.database import collection
+from app.utils import clean_doc, now
 
 class ProgressRepository:
-    def __init__(self):
-        self.collection = student_progress_collection
+    def list_for_user(self, user_id):
+        q={"user_id":user_id}
+        rows=list(collection("student_progress").find(q))
+        if not rows:
+            rows=list(collection("student_progress").find({"userId":user_id}))
+        return [clean_doc(x) for x in rows]
 
-    def find_by_id(self, document_id):
-        from app.utils.helpers import object_id
-        return self.collection.find_one({"_id": object_id(document_id)})
-
-    def find_all(self, filter_query=None, limit=100):
-        return list(self.collection.find(filter_query or {}).limit(limit))
-
-    def insert(self, data):
-        return self.collection.insert_one(data)
-
-    def update_by_id(self, document_id, data):
-        from app.utils.helpers import object_id
-        return self.collection.update_one(
-            {"_id": object_id(document_id)},
-            {"$set": data}
-        )
-
-    def delete_by_id(self, document_id):
-        from app.utils.helpers import object_id
-        return self.collection.delete_one({"_id": object_id(document_id)})
+    def upsert(self, user_id, data):
+        q={"user_id":user_id,"lesson_id":data["lesson_id"]}
+        doc={**data,"user_id":user_id,"updated_at":now()}
+        collection("student_progress").update_one(q,{"$set":doc},upsert=True)
+        return clean_doc(collection("student_progress").find_one(q))

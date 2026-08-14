@@ -1,36 +1,25 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from app.database import ping_database
-from app.routers import (
-    auth, users, courses, subjects, lessons, videos, quizzes,
-    progress, bookmarks, achievements, notifications
-)
+from fastapi.middleware.cors import CORSMiddleware
+from app.config import settings
+from app.database import ping_database, close_database
+from app.routers import auth,content,student,admin,health
 
-app = FastAPI(
-    title="Smart Learning Lab API",
-    description="Backend API for the Smart Learning Lab Android application",
-    version="1.0.0"
-)
+@asynccontextmanager
+async def lifespan(app):
+    ping_database()
+    yield
+    close_database()
 
-app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
-app.include_router(users.router, prefix="/api/users", tags=["Users"])
-app.include_router(courses.router, prefix="/api/courses", tags=["Courses"])
-app.include_router(subjects.router, prefix="/api/subjects", tags=["Subjects"])
-app.include_router(lessons.router, prefix="/api/lessons", tags=["Lessons"])
-app.include_router(videos.router, prefix="/api/videos", tags=["Videos"])
-app.include_router(quizzes.router, prefix="/api/quizzes", tags=["Quizzes"])
-app.include_router(progress.router, prefix="/api/progress", tags=["Progress"])
-app.include_router(bookmarks.router, prefix="/api/bookmarks", tags=["Bookmarks"])
-app.include_router(achievements.router, prefix="/api/achievements", tags=["Achievements"])
-app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
+app=FastAPI(title="Smart Learning Lab API",description="MongoDB-backed learning API",version="3.1.0",lifespan=lifespan)
+origins=["*"] if settings.cors_origins=="*" else [x.strip() for x in settings.cors_origins.split(",") if x.strip()]
+app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
+app.include_router(auth.router,prefix="/api/auth",tags=["Authentication"])
+app.include_router(content.router,prefix="/api",tags=["Learning Content"])
+app.include_router(student.router,prefix="/api",tags=["Student"])
+app.include_router(admin.router,prefix="/api/admin",tags=["Admin"])
+app.include_router(health.router,prefix="/api",tags=["Health"])
 
 @app.get("/")
-def welcome():
-    return {"message": "Welcome to Smart Learning Lab API", "status": "success", "version": "1.0.0"}
-
-@app.get("/api/health")
-def health():
-    try:
-        ping_database()
-        return {"status": "success", "api": "up", "database": "connected"}
-    except Exception as exc:
-        return {"status": "error", "api": "up", "database": "disconnected", "detail": str(exc)}
+def root():
+    return {"status":"success","app":"Smart Learning Lab","version":"3.1.0","database":"MongoDB"}

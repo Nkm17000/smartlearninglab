@@ -1,9 +1,5 @@
-__pycache__/
-*.py[cod]
-.venv/
-venv/
 .env
-.vscode/
-.idea/
+.venv/
+__pycache__/
+*.pyc
 .pytest_cache/
-*.log
