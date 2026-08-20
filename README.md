@@ -1,67 +1,57 @@
-# Smart Learning Lab Backend v1
+# Smart Learning Lab - Professional Backend v2
 
-## What this backend provides
+This backend is designed for the simplified professional Admin Portal:
 
-- Student/Admin authentication
-- Role-based authorization
-- Student dashboard
-- Exams, subjects, topics, courses, lessons
-- Question bank and practice
-- Mock tests and submission
-- Progress, mistakes, notes
-- Current affairs
-- AI conversation/message storage
-- Admin dashboard
-- Admin CRUD for learning content
-- MongoDB Atlas
+**Create Course → Add Modules → Add Lessons → Question Bank → Create Quiz → Publish**
 
-## Setup
+It keeps the existing learning endpoints and generic admin CRUD for compatibility, while adding clearer admin aliases for modules, lessons and quiz questions.
 
-1. Copy `.env.example` to `.env`.
-2. Put your MongoDB Atlas URI with `/smart_learning_lab` at the end.
-3. Set a strong JWT_SECRET_KEY.
-4. Install dependencies:
+## Local setup
 
-   python -m pip install -r requirements.txt
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-5. Seed the database:
+Copy `.env.example` to `.env` and set the real MongoDB URI and JWT secret.
 
-   python seed.py
+Start:
 
-The seed clears only application collections and recreates starter data.
-
-## Demo accounts
-
-Admin:
-admin@smartlearninglab.com
-ChangeMe123!
-
-Student:
-nitin@example.com
-Password123!
-
-Change these passwords before any real/public deployment.
-
-## Run locally
-
+```powershell
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
 
-Swagger:
-http://127.0.0.1:8000/docs
-
-Health:
-http://127.0.0.1:8000/health
+Open `http://127.0.0.1:8000/docs`.
 
 ## Render
 
-Start command:
+Build:
+
+```text
+pip install -r requirements.txt
+```
+
+Start:
+
+```text
 uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
 
-Environment variables:
-MONGODB_URI
-JWT_SECRET_KEY
-JWT_ALGORITHM
-ACCESS_TOKEN_EXPIRE_MINUTES
-CORS_ORIGINS
+Set `MONGODB_URI`, `MONGODB_DB`, `JWT_SECRET_KEY`, and `CORS_ORIGINS` in Render Environment Variables.
 
-Do not commit `.env` or real secrets.
+## Admin workflow endpoints
+
+- `GET/POST /api/v1/admin/courses`
+- `GET/POST /api/v1/admin/courses/{course_id}/modules`
+- `GET/POST /api/v1/admin/modules/{module_id}/lessons`
+- `GET/POST/PUT/DELETE /api/v1/admin/questions...`
+- `GET/POST/PUT/DELETE /api/v1/admin/quizzes...`
+- `POST /api/v1/admin/quizzes/{quiz_id}/questions`
+- `DELETE /api/v1/admin/quizzes/{quiz_id}/questions/{question_id}`
+
+All Admin endpoints require a bearer token for a user whose role is `admin`.
+
+## Existing API compatibility
+
+The previous endpoints remain available, including `/api/v1/auth/*`, `/api/v1/exams`, `/api/v1/subjects`, `/api/v1/topics`, `/api/v1/courses`, `/api/v1/lessons`, `/api/v1/questions`, `/api/v1/mock-tests`, `/api/v1/dashboard`, `/api/v1/progress`, `/api/v1/notes`, and `/api/v1/ai/*`.
