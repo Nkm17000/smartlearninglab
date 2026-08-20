@@ -144,7 +144,10 @@ def enroll(course_id: str, user=Depends(current_user)):
     existing=db.enrollments.find_one({"user_id":user_id,"course_id":course_id})
     if existing: return clean(existing)
     d={"_id":uuid.uuid4().hex,"user_id":user_id,"course_id":course_id,"status":"active","created_at":datetime.now(timezone.utc),"updated_at":datetime.now(timezone.utc)}
-    db.enrollments.insert_one(d); return clean(d)
+    db.enrollments.insert_one(d)
+    db.courses.update_one({"_id": c_id}, {"$inc": {"students_count": 1}}) if (c_id := course_id) else None
+    db.notifications.insert_one({"_id": uuid.uuid4().hex, "user_id": user_id, "title": "Course enrolled", "message": f"You enrolled in {course_id}.", "read": False, "created_at": datetime.now(timezone.utc)})
+    return clean(d)
 
 @router.get("/enrollments")
 def enrollments(user=Depends(current_user)):
@@ -174,6 +177,7 @@ def complete_lesson(lesson_id: str, user=Depends(current_user)):
     l=published("lessons",lesson_id); db=get_db()
     d={"_id":uuid.uuid4().hex,"user_id":uid(user),"course_id":l.get("course_id"),"lesson_id":lesson_id,"completed":True,"completed_at":datetime.now(timezone.utc),"updated_at":datetime.now(timezone.utc)}
     db.progress.update_one({"user_id":uid(user),"lesson_id":lesson_id},{"$set":d},upsert=True)
+    db.notifications.insert_one({"_id": uuid.uuid4().hex, "user_id": uid(user), "title": "Lesson completed", "message": "Great job! You completed a lesson.", "read": False, "created_at": datetime.now(timezone.utc)})
     return clean(d)
 
 # Quiz discovery and attempt
