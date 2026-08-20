@@ -1,85 +1,82 @@
-# Smart Learning Lab Backend - Admin/Student API
-
-This version is aligned with the professional Expo FE.
+# Smart Learning Lab — Final Backend
 
 ## MongoDB
+No separate `MONGODB_DB` variable is used. Put the database name in `MONGODB_URI`:
 
-No separate `MONGODB_DB` variable is required. Put the database name directly in the URI:
-
-```env
 MONGODB_URI=mongodb+srv://username:password@smartstudylab.juh84i5.mongodb.net/smart_learning_lab
-JWT_SECRET_KEY=your-long-random-secret
-JWT_EXPIRE_MINUTES=1440
-CORS_ORIGINS=http://localhost:8081,http://127.0.0.1:8081
-```
 
-## Run locally
-
-```powershell
+## Run
 pip install -r requirements.txt
 python seed_admin.py
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
 
-Swagger:
+Swagger: http://127.0.0.1:8000/docs
 
-`http://127.0.0.1:8000/docs`
+## Demo accounts
+Admin: admin@smartlearninglab.com / ChangeMe123!
+Student: nitin@example.com / Password123!
 
-## Render
+## Admin content model
+Course
+  -> Module / Topic
+      -> Lesson
+          -> progress
+  -> Quiz
+      -> Question Bank questions
 
-Environment variables:
+Courses support:
+- title/name
+- description and short description
+- category
+- language
+- level
+- learning objectives
+- prerequisites
+- estimated duration
+- thumbnail URL
+- publish/draft
 
-- `MONGODB_URI`
-- `JWT_SECRET_KEY`
-- `JWT_EXPIRE_MINUTES=1440`
-- `CORS_ORIGINS=*` (or your deployed FE origin)
+Modules support:
+- title/name
+- description
+- learning objectives
+- order
+- estimated minutes
 
-Start command:
+Lessons support:
+- title/name
+- description
+- rich text/content
+- duration
+- resources
+- order
+- publish/draft
 
-```text
-uvicorn app.main:app --host 0.0.0.0 --port $PORT
-```
+Questions support:
+- MCQ options
+- correct answer
+- difficulty
+- marks
+- negative marks
+- explanation
 
-## Main Admin workflow
+Quizzes support:
+- course/module association
+- duration
+- passing percentage
+- attempts
+- question list
+- publish/draft
+- add existing question
+- create new question directly inside quiz
 
-```text
-Admin Home
-  -> Courses
-  -> Manage Course
-  -> Modules
-  -> Lessons
-  -> Question Bank
-  -> Quizzes
-  -> Publish
-```
-
-Important dedicated endpoints:
-
-```text
-GET    /api/v1/admin/courses
-POST   /api/v1/admin/courses
-GET    /api/v1/admin/courses/{course_id}
-PUT    /api/v1/admin/courses/{course_id}
-DELETE /api/v1/admin/courses/{course_id}
-
-GET    /api/v1/admin/courses/{course_id}/modules
-POST   /api/v1/admin/courses/{course_id}/modules
-
-GET    /api/v1/admin/modules/{module_id}/lessons
-POST   /api/v1/admin/modules/{module_id}/lessons
-
-GET    /api/v1/admin/questions
-POST   /api/v1/admin/questions
-PUT    /api/v1/admin/questions/{question_id}
-DELETE /api/v1/admin/questions/{question_id}
-
-GET    /api/v1/admin/quizzes
-POST   /api/v1/admin/quizzes
-PUT    /api/v1/admin/quizzes/{quiz_id}
-DELETE /api/v1/admin/quizzes/{quiz_id}
-
-POST   /api/v1/admin/quizzes/{quiz_id}/questions
-DELETE /api/v1/admin/quizzes/{quiz_id}/questions/{question_id}
-```
-
-The `GET /api/v1/admin/courses/{course_id}` endpoint is specifically included so the FE Manage Course button does not receive HTTP 405.
+Student supports:
+- dashboard
+- course discovery
+- enrollment
+- modules/lessons
+- progress
+- quizzes
+- quiz questions
+- attempts/results
+- notes
