@@ -11,13 +11,8 @@ class Settings(BaseSettings):
 
     # MongoDB
     #
-    # IMPORTANT:
-    # Put the database name directly in the URI:
-    #
-    # mongodb+srv://USER:PASSWORD@HOST/smart_learning_lab
-    #
-    # This prevents the application from accidentally selecting
-    # a wrongly named database.
+    # Example:
+    # mongodb+srv://username:password@cluster.mongodb.net/smart_learning_lab
     mongodb_uri: str
 
     # JWT
@@ -34,6 +29,29 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """
+        Convert comma-separated CORS origins into a list.
+
+        Example:
+        CORS_ORIGINS=http://localhost:8081,http://localhost:19006
+
+        becomes:
+        [
+            "http://localhost:8081",
+            "http://localhost:19006"
+        ]
+        """
+        if not self.cors_origins:
+            return ["*"]
+
+        return [
+            origin.strip()
+            for origin in self.cors_origins.split(",")
+            if origin.strip()
+        ]
 
 
 @lru_cache
