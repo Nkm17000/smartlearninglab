@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
-from app.core.security import admin_user
+from app.core.security import admin_user, root_admin_user, hash_password
 from app.db.mongo import get_db
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
@@ -72,17 +72,18 @@ def delete_doc(collection, item_id):
 @router.get("/dashboard")
 def dashboard(user=Depends(admin_user)):
     db = get_db()
-    return {
-        "admin": {"id": str(user["_id"]), "name": user.get("name", "Admin")},
-        "counts": {
-            "courses": db.courses.count_documents({}),
-            "modules": db.topics.count_documents({}),
-            "lessons": db.lessons.count_documents({}),
-            "questions": db.questions.count_documents({}),
-            "quizzes": db.quizzes.count_documents({}),
-            "students": db.users.count_documents({"role": "student"}),
-        }
-    }
+    courses = db.courses.count_documents({})
+    published_courses = db.courses.count_documents({"is_published": True})
+    modules = db.topics.count_documents({})
+    lessons = db.lessons.count_documents({})
+    questions = db.questions.count_documents({})
+    quizzes = db.quizzes.count_documents({})
+    published_quizzes = db.quizzes.count_documents({"is_published": True})
+    students = db.users.count_documents({"role": "student"})
+    admins = db.users.count_documents({"role": {"$in": ["root_admin", "admin", "content_admin", "instructor", "support_admin"]}})
+    quiz_attempts = sum(db[name].count_documents({}) for name in ("quiz_attempts", "quiz_results", "results"))
+    counts = {"courses": courses, "published_courses": published_courses, "draft_courses": courses-published_courses, "modules": modules, "lessons": lessons, "questions": questions, "quizzes": quizzes, "published_quizzes": published_quizzes, "students": students, "admins": admins, "quiz_attempts": quiz_attempts}
+    return {"admin": {"id": str(user["_id"]), "name": user.get("name", "Admin"), "role": user.get("role")}, "counts": counts, **counts}
 
 # Courses
 @router.get("/courses")
@@ -376,3 +377,45 @@ def student_status(student_id: str, data: dict, user=Depends(admin_user)):
     active = bool(data.get("is_active", True))
     get_db().users.update_one({"_id": x["_id"]}, {"$set": {"is_active": active, "updated_at": now()}})
     return {"id": str(x["_id"]), "is_active": active}
+
+
+# Root admin: manage staff/admin accounts with explicit roles.
+@router.get("/users/admins")
+def list_admins(user=Depends(root_admin_user)):
+    roles = {"root_admin", "admin", "content_admin", "instructor", "support_admin"}
+    return [clean(x) for x in get_db().users.find({"role": {"$in": list(roles)}}, {"password_hash": 0}).sort("created_at", -1)]
+
+@router.post("/users/admins")
+def create_admin(data: dict, user=Depends(root_admin_user)):
+    name = str(data.get("name", "")).strip()
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    role = str(data.get("role", "admin")).strip()
+    allowed = {"admin", "content_admin", "instructor", "support_admin"}
+    if not name or len(name) < 2: raise HTTPException(422, "Name is required")
+    if not email or "@" not in email: raise HTTPException(422, "Valid email is required")
+    if len(password) < 8: raise HTTPException(422, "Password must contain at least 8 characters")
+    if role not in allowed: raise HTTPException(422, "Invalid admin role")
+    db = get_db()
+    if db.users.find_one({"email": email}): raise HTTPException(409, "Email already registered")
+    d = {"_id": uuid.uuid4().hex, "name": name, "email": email, "password_hash": hash_password(password), "role": role, "is_active": True, "auth_provider": "password", "created_at": now(), "updated_at": now()}
+    db.users.insert_one(d)
+    d.pop("password_hash", None)
+    return clean(d)
+
+@router.put("/users/admins/{user_id}/status")
+def admin_status(user_id: str, data: dict, user=Depends(root_admin_user)):
+    x = find_by_id("users", user_id)
+    if not x or x.get("role") == "student": raise HTTPException(404, "Admin user not found")
+    if str(x["_id"]) == str(user["_id"]): raise HTTPException(400, "Root admin cannot disable itself")
+    active = bool(data.get("is_active", True))
+    get_db().users.update_one({"_id": x["_id"]}, {"$set": {"is_active": active, "updated_at": now()}})
+    return {"id": str(x["_id"]), "is_active": active}
+
+@router.delete("/users/admins/{user_id}")
+def delete_admin(user_id: str, user=Depends(root_admin_user)):
+    x = find_by_id("users", user_id)
+    if not x or x.get("role") == "student": raise HTTPException(404, "Admin user not found")
+    if str(x["_id"]) == str(user["_id"]): raise HTTPException(400, "Root admin cannot delete itself")
+    get_db().users.delete_one({"_id": x["_id"]})
+    return {"message": "Admin user deleted"}

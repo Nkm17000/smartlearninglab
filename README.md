@@ -44,3 +44,24 @@ No separate MONGODB_DB setting is required. The database is taken from the Mongo
 Course -> Topics/Modules -> Lessons -> Quizzes -> Questions.
 
 Courses also support exam/category, instructor, language, tags, free flag, video/PDF/mock-test counts, featured flag and learning objectives. All of these can be managed from the admin portal; no direct MongoDB editing is required.
+
+## Authentication features
+- Student registration: `POST /api/v1/auth/register`
+- Forgot password email: `POST /api/v1/auth/forgot-password`
+- Reset password: `POST /api/v1/auth/reset-password`
+- Google OAuth: `/api/v1/auth/google/start` and callback
+- GitHub OAuth: `/api/v1/auth/github/start` and callback
+- Root Admin can create staff roles: admin, content_admin, instructor, support_admin.
+
+Configure SMTP and OAuth credentials in `.env` before enabling those features.
+
+## Google / GitHub OAuth setup
+1. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI`.
+2. Set `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `GITHUB_REDIRECT_URI`.
+3. For local development, use the callback URLs shown in the FE README.
+4. In production, use the public Render API callback URLs and set `FRONTEND_WEB_URL` to the deployed FE URL.
+
+OAuth users are created as `student` accounts. Existing users with the same email are linked to the social provider.
+
+## Password reset email
+Configure SMTP (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`). Gmail requires an App Password when 2-step verification is enabled.
