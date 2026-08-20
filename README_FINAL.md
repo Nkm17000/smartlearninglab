@@ -60,3 +60,7 @@ Optional AI provider:
 `OPENAI_API_KEY=...`
 `OPENAI_MODEL=gpt-4o-mini`
 Without a provider key, the course/quiz generators and tutor use deterministic/local behavior so the workflows can still be tested.
+
+## Video review fixes
+
+The student home now receives enrolled-course progress from `/api/v1/dashboard`, and course overview lessons include their `lesson_resources`. These changes prevent the FE from showing an incomplete course card when progress/resource data exists in MongoDB.

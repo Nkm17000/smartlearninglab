@@ -50,7 +50,15 @@ def dashboard(user=Depends(current_user)):
     enrolled_courses=[]
     for e in enrollments:
         c=db.courses.find_one({"_id":e.get("course_id")})
-        if c: enrolled_courses.append(clean(c))
+        if c:
+            course_id=str(e.get("course_id"))
+            total=db.lessons.count_documents({"course_id":course_id,"is_published":True})
+            done=db.progress.count_documents({"user_id":user_id,"course_id":course_id,"completed":True})
+            item=clean(c)
+            item["progress_percentage"]=round(done*100/total,2) if total else 0
+            item["completed_lessons"]=done
+            item["total_lessons"]=total
+            enrolled_courses.append(item)
     return {
         "user": {"id": user_id, "name": user.get("name"), "email": user.get("email"), "role": user.get("role")},
         "courses_available": db.courses.count_documents({"is_published": True}),
@@ -106,6 +114,9 @@ def course_overview(course_id:str,user=Depends(current_user)):
     modules=[clean(x) for x in db.topics.find({"course_id":course_id,"is_published":True}).sort("order",1)]
     lessons=[clean(x) for x in db.lessons.find({"course_id":course_id,"is_published":True}).sort("order",1)]
     quizzes=[clean(x) for x in db.quizzes.find({"course_id":course_id,"is_published":True}).sort("created_at",-1)]
+    for lesson in lessons:
+        lesson_id=str(lesson.get("_id"))
+        lesson["resources"]=clean(list(db.lesson_resources.find({"lesson_id":lesson_id}).sort("order",1)))
     return {"course":clean(c),"modules":modules,"lessons":lessons,"quizzes":quizzes}
 
 @router.get("/courses/{course_id}")
