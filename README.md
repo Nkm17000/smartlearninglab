@@ -1,69 +1,67 @@
-# Smart Learning Lab Backend
+# Smart Learning Lab Backend v1
 
-FastAPI + PyMongo backend for the Smart Learning Lab competitive-exam preparation app.
+## What this backend provides
 
-## Main features
-
-- JWT authentication
-- User profiles and selected exams
-- Exams, subjects, topics, courses and lessons
-- Question bank and PYQs
-- Practice sets and mock tests
-- Test attempts, answers and result analysis
-- Student progress, mastery, mistakes and revision queue
-- Study plans and daily goals
+- Student/Admin authentication
+- Role-based authorization
+- Student dashboard
+- Exams, subjects, topics, courses, lessons
+- Question bank and practice
+- Mock tests and submission
+- Progress, mistakes, notes
 - Current affairs
-- Bookmarks, favorites and personal notes
-- Notifications
-- Admin content management
-- Basic AI conversation storage endpoint
-- Health check
-- MongoDB indexes
-- Render-ready deployment
+- AI conversation/message storage
+- Admin dashboard
+- Admin CRUD for learning content
+- MongoDB Atlas
+
+## Setup
+
+1. Copy `.env.example` to `.env`.
+2. Put your MongoDB Atlas URI with `/smart_learning_lab` at the end.
+3. Set a strong JWT_SECRET_KEY.
+4. Install dependencies:
+
+   python -m pip install -r requirements.txt
+
+5. Seed the database:
+
+   python seed.py
+
+The seed clears only application collections and recreates starter data.
+
+## Demo accounts
+
+Admin:
+admin@smartlearninglab.com
+ChangeMe123!
+
+Student:
+nitin@example.com
+Password123!
+
+Change these passwords before any real/public deployment.
 
 ## Run locally
 
-1. Create `.env` from `.env.example`.
-2. Set `MONGODB_URI`.
-3. Install dependencies:
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
-```bash
-python -m pip install -r requirements.txt
-```
+Swagger:
+http://127.0.0.1:8000/docs
 
-4. Start:
+Health:
+http://127.0.0.1:8000/health
 
-```bash
-uvicorn app.main:app --reload
-```
+## Render
 
-API:
-- http://127.0.0.1:8000
-- Swagger: http://127.0.0.1:8000/docs
-- Health: http://127.0.0.1:8000/health
+Start command:
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
-## Seed sample data
+Environment variables:
+MONGODB_URI
+JWT_SECRET_KEY
+JWT_ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES
+CORS_ORIGINS
 
-```bash
-python seed.py
-```
-
-The seed script is safe to run repeatedly for the same sample records.
-
-## Authentication
-
-Register:
-
-POST /api/v1/auth/register
-
-Login:
-
-POST /api/v1/auth/login
-
-Use the returned access token as:
-
-Authorization: Bearer <token>
-
-## Important
-
-The backend expects the MongoDB database `smart_learning_lab`. Collections may already exist; the application does not delete or recreate them.
+Do not commit `.env` or real secrets.

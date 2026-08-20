@@ -1,68 +1,26 @@
-from datetime import datetime, timezone
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
-from bson import ObjectId
-
+from app.core.deps import current_user
 from app.db.mongo import get_db
-from app.core.security import get_current_user
-from app.utils import serialize_doc
+from datetime import datetime
+import uuid
 
-router = APIRouter(prefix="/ai", tags=["AI"])
-
-
-class ConversationRequest(BaseModel):
-    title: str | None = None
-    examId: str | None = None
-    topicId: str | None = None
-
-
-class MessageRequest(BaseModel):
-    conversationId: str
-    message: str = Field(min_length=1, max_length=10000)
-    language: str = "en"
-    contextType: str | None = None
-    contextId: str | None = None
-
-
-@router.post("/conversations")
-def create_conversation(payload: ConversationRequest, current_user=Depends(get_current_user)):
-    db = get_db()
-    now = datetime.now(timezone.utc)
-    doc = payload.model_dump()
-    doc.update({"userId": current_user["id"], "createdAt": now, "updatedAt": now})
-    result = db.ai_conversations.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    return serialize_doc(doc)
-
+router=APIRouter(prefix="/ai", tags=["AI"])
 
 @router.get("/conversations")
-def conversations(current_user=Depends(get_current_user)):
-    docs = list(get_db().ai_conversations.find({"userId": current_user["id"]}).sort("updatedAt", -1))
-    return [serialize_doc(x) for x in docs]
+def conversations(user=Depends(current_user)):
+    return list(get_db().ai_conversations.find({"user_id": str(user["_id"])}).sort("updated_at",-1).limit(50))
 
-
-@router.post("/messages")
-def save_message(payload: MessageRequest, current_user=Depends(get_current_user)):
-    db = get_db()
-    conversation = db.ai_conversations.find_one(
-        {"_id": ObjectId(payload.conversationId), "userId": current_user["id"]}
-    )
-    if not conversation:
-        from fastapi import HTTPException
-        raise HTTPException(404, "Conversation not found")
-
-    now = datetime.now(timezone.utc)
-    doc = payload.model_dump()
-    doc.update({"userId": current_user["id"], "role": "user", "createdAt": now})
-    result = db.ai_messages.insert_one(doc)
-    db.ai_conversations.update_one({"_id": conversation["_id"]}, {"$set": {"updatedAt": now}})
-    doc["_id"] = result.inserted_id
-    return serialize_doc(doc)
-
+@router.post("/conversations")
+def create_conversation(data: dict | None = None, user=Depends(current_user)):
+    d=dict(data or {})
+    d.update({"_id":uuid.uuid4().hex,"user_id":str(user["_id"]),"title":d.get("title","Study Assistant"),"created_at":datetime.utcnow(),"updated_at":datetime.utcnow()})
+    get_db().ai_conversations.insert_one(d); d["id"]=d.pop("_id"); return d
 
 @router.get("/conversations/{conversation_id}/messages")
-def messages(conversation_id: str, current_user=Depends(get_current_user)):
-    docs = list(get_db().ai_messages.find(
-        {"conversationId": conversation_id, "userId": current_user["id"]}
-    ).sort("createdAt", 1))
-    return [serialize_doc(x) for x in docs]
+def messages(conversation_id: str, user=Depends(current_user)):
+    return list(get_db().ai_messages.find({"conversation_id":conversation_id,"user_id":str(user["_id"])}).sort("created_at",1))
+
+@router.post("/messages")
+def save_message(data: dict, user=Depends(current_user)):
+    d=dict(data); d.update({"_id":uuid.uuid4().hex,"user_id":str(user["_id"]),"role":"user","created_at":datetime.utcnow()})
+    get_db().ai_messages.insert_one(d); d["id"]=d.pop("_id"); return d
