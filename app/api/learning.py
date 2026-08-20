@@ -46,12 +46,19 @@ def dashboard(user=Depends(current_user)):
     attempts = list(db.test_attempts.find({"user_id": user_id, "status": "submitted"}))
     avg = round(sum(float(a.get("result", {}).get("percentage", 0)) for a in attempts)/len(attempts), 2) if attempts else 0
     done = sum(1 for p in progress if p.get("completed"))
+    enrollments=list(db.enrollments.find({"user_id":user_id,"status":"active"}).sort("updated_at",-1).limit(6))
+    enrolled_courses=[]
+    for e in enrollments:
+        c=db.courses.find_one({"_id":e.get("course_id")})
+        if c: enrolled_courses.append(clean(c))
     return {
         "user": {"id": user_id, "name": user.get("name"), "email": user.get("email"), "role": user.get("role")},
         "courses_available": db.courses.count_documents({"is_published": True}),
         "lessons_completed": done,
         "quiz_attempts": len(attempts),
         "quiz_average": avg,
+        "enrolled_courses": enrolled_courses,
+        "recent_quiz_results": [clean(x) for x in attempts[:5]],
     }
 
 @router.get("/profile")
@@ -59,10 +66,47 @@ def profile(user=Depends(current_user)):
     return {"id": uid(user), "name": user.get("name",""), "email": user.get("email",""), "role": user.get("role","student"), "is_active": user.get("is_active",True)}
 
 @router.get("/courses")
-def courses(search: str | None = None, user=Depends(current_user)):
+def courses(search: str | None = None, category: str | None = None, level: str | None = None, language: str | None = None, free_only: bool = True, user=Depends(current_user)):
     q = {"is_published": True}
-    if search: q["$or"] = [{"name":{"$regex":search,"$options":"i"}},{"title":{"$regex":search,"$options":"i"}}]
-    return [clean(x) for x in get_db().courses.find(q).sort("created_at",-1)]
+    if search:
+        q["$or"] = [
+            {"name":{"$regex":search,"$options":"i"}},
+            {"title":{"$regex":search,"$options":"i"}},
+            {"description":{"$regex":search,"$options":"i"}},
+            {"exam":{"$regex":search,"$options":"i"}},
+            {"tags":{"$regex":search,"$options":"i"}},
+        ]
+    if category: q["category"] = {"$regex":category,"$options":"i"}
+    if level: q["level"] = {"$regex":level,"$options":"i"}
+    if language: q["language"] = {"$regex":language,"$options":"i"}
+    if free_only: q["$or_free"] = True
+    # Mongo cannot use a synthetic key; free courses are the default in this free app.
+    if "or_free" in q: q.pop("or_free", None)
+    items=[clean(x) for x in get_db().courses.find(q).sort([("featured",-1),("created_at",-1)])]
+    return items
+
+@router.get("/catalog/categories")
+def catalog_categories(user=Depends(current_user)):
+    db=get_db()
+    cats=[x for x in db.courses.distinct("category") if x]
+    exams=[x for x in db.courses.distinct("exam") if x]
+    levels=[x for x in db.courses.distinct("level") if x]
+    return {"categories":sorted(cats),"exams":sorted(exams),"levels":sorted(levels)}
+
+@router.get("/catalog/featured")
+def catalog_featured(limit:int=Query(8,ge=1,le=30),user=Depends(current_user)):
+    db=get_db()
+    courses=[clean(x) for x in db.courses.find({"is_published":True}).sort([("featured",-1),("created_at",-1)]).limit(limit)]
+    quizzes=[clean(x) for x in db.quizzes.find({"is_published":True}).sort([("featured",-1),("created_at",-1)]).limit(limit)]
+    return {"courses":courses,"quizzes":quizzes}
+
+@router.get("/courses/{course_id}/overview")
+def course_overview(course_id:str,user=Depends(current_user)):
+    c=published("courses",course_id); db=get_db()
+    modules=[clean(x) for x in db.topics.find({"course_id":course_id,"is_published":True}).sort("order",1)]
+    lessons=[clean(x) for x in db.lessons.find({"course_id":course_id,"is_published":True}).sort("order",1)]
+    quizzes=[clean(x) for x in db.quizzes.find({"course_id":course_id,"is_published":True}).sort("created_at",-1)]
+    return {"course":clean(c),"modules":modules,"lessons":lessons,"quizzes":quizzes}
 
 @router.get("/courses/{course_id}")
 def course(course_id: str, user=Depends(current_user)):
