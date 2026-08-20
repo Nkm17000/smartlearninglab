@@ -1,10 +1,14 @@
 from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     mongodb_uri: str
-    jwt_secret_key: str = "CHANGE_ME"
+
+    jwt_secret_key: str = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
+    jwt_expire_minutes: int = 1440
+
     cors_origins: str = "*"
 
     model_config = SettingsConfigDict(
