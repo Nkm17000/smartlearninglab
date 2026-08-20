@@ -1,57 +1,85 @@
-# Smart Learning Lab - Professional Backend v2
+# Smart Learning Lab Backend - Admin/Student API
 
-This backend is designed for the simplified professional Admin Portal:
+This version is aligned with the professional Expo FE.
 
-**Create Course → Add Modules → Add Lessons → Question Bank → Create Quiz → Publish**
+## MongoDB
 
-It keeps the existing learning endpoints and generic admin CRUD for compatibility, while adding clearer admin aliases for modules, lessons and quiz questions.
+No separate `MONGODB_DB` variable is required. Put the database name directly in the URI:
 
-## Local setup
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+```env
+MONGODB_URI=mongodb+srv://username:password@smartstudylab.juh84i5.mongodb.net/smart_learning_lab
+JWT_SECRET_KEY=your-long-random-secret
+JWT_EXPIRE_MINUTES=1440
+CORS_ORIGINS=http://localhost:8081,http://127.0.0.1:8081
 ```
 
-Copy `.env.example` to `.env` and set the real MongoDB URI and JWT secret.
-
-Start:
+## Run locally
 
 ```powershell
+pip install -r requirements.txt
+python seed_admin.py
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Open `http://127.0.0.1:8000/docs`.
+Swagger:
+
+`http://127.0.0.1:8000/docs`
 
 ## Render
 
-Build:
+Environment variables:
 
-```text
-pip install -r requirements.txt
-```
+- `MONGODB_URI`
+- `JWT_SECRET_KEY`
+- `JWT_EXPIRE_MINUTES=1440`
+- `CORS_ORIGINS=*` (or your deployed FE origin)
 
-Start:
+Start command:
 
 ```text
 uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
-Set `MONGODB_URI`, `MONGODB_DB`, `JWT_SECRET_KEY`, and `CORS_ORIGINS` in Render Environment Variables.
+## Main Admin workflow
 
-## Admin workflow endpoints
+```text
+Admin Home
+  -> Courses
+  -> Manage Course
+  -> Modules
+  -> Lessons
+  -> Question Bank
+  -> Quizzes
+  -> Publish
+```
 
-- `GET/POST /api/v1/admin/courses`
-- `GET/POST /api/v1/admin/courses/{course_id}/modules`
-- `GET/POST /api/v1/admin/modules/{module_id}/lessons`
-- `GET/POST/PUT/DELETE /api/v1/admin/questions...`
-- `GET/POST/PUT/DELETE /api/v1/admin/quizzes...`
-- `POST /api/v1/admin/quizzes/{quiz_id}/questions`
-- `DELETE /api/v1/admin/quizzes/{quiz_id}/questions/{question_id}`
+Important dedicated endpoints:
 
-All Admin endpoints require a bearer token for a user whose role is `admin`.
+```text
+GET    /api/v1/admin/courses
+POST   /api/v1/admin/courses
+GET    /api/v1/admin/courses/{course_id}
+PUT    /api/v1/admin/courses/{course_id}
+DELETE /api/v1/admin/courses/{course_id}
 
-## Existing API compatibility
+GET    /api/v1/admin/courses/{course_id}/modules
+POST   /api/v1/admin/courses/{course_id}/modules
 
-The previous endpoints remain available, including `/api/v1/auth/*`, `/api/v1/exams`, `/api/v1/subjects`, `/api/v1/topics`, `/api/v1/courses`, `/api/v1/lessons`, `/api/v1/questions`, `/api/v1/mock-tests`, `/api/v1/dashboard`, `/api/v1/progress`, `/api/v1/notes`, and `/api/v1/ai/*`.
+GET    /api/v1/admin/modules/{module_id}/lessons
+POST   /api/v1/admin/modules/{module_id}/lessons
+
+GET    /api/v1/admin/questions
+POST   /api/v1/admin/questions
+PUT    /api/v1/admin/questions/{question_id}
+DELETE /api/v1/admin/questions/{question_id}
+
+GET    /api/v1/admin/quizzes
+POST   /api/v1/admin/quizzes
+PUT    /api/v1/admin/quizzes/{quiz_id}
+DELETE /api/v1/admin/quizzes/{quiz_id}
+
+POST   /api/v1/admin/quizzes/{quiz_id}/questions
+DELETE /api/v1/admin/quizzes/{quiz_id}/questions/{question_id}
+```
+
+The `GET /api/v1/admin/courses/{course_id}` endpoint is specifically included so the FE Manage Course button does not receive HTTP 405.
