@@ -38,3 +38,25 @@ The backend deliberately keeps external vendor credentials optional. The retriev
 The speaking endpoint evaluates a transcript. Connect an STT service (for example an Expo-compatible speech-to-text provider) to turn microphone audio into a transcript before calling `/api/v1/speaking/evaluate`.
 
 Push-token registration is included; sending push notifications requires an Expo push service worker/job or another push provider.
+
+## Feature-complete release
+
+This release explicitly includes:
+1. AI Course Generator
+2. AI Quiz Generator
+3. AI Tutor + lexical RAG with optional OpenAI provider
+4. AI Speaking Practice evaluation
+5. Personalized Learning Path
+6. Adaptive Tests
+7. Flashcards + spaced repetition
+8. Advanced student/admin analytics
+9. Interview Preparation
+10. Community posts, comments and likes
+
+### Demo seed
+Run `python seed.py` to create/update demo users, an English course, lessons, quizzes, progress, flashcards, community content and analytics activity.
+
+Optional AI provider:
+`OPENAI_API_KEY=...`
+`OPENAI_MODEL=gpt-4o-mini`
+Without a provider key, the course/quiz generators and tutor use deterministic/local behavior so the workflows can still be tested.
