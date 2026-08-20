@@ -1,82 +1,46 @@
-# Smart Learning Lab — Final Backend
+# Smart Learning Lab — Adda-style learning platform backend
 
-## MongoDB
-No separate `MONGODB_DB` variable is used. Put the database name in `MONGODB_URI`:
+This version uses the uploaded Adda247-style workflow as a product/design reference: exam/category discovery, featured courses, structured course curriculum, test series, resources and learner progress. It does not copy Adda247 branding/assets.
 
-MONGODB_URI=mongodb+srv://username:password@smartstudylab.juh84i5.mongodb.net/smart_learning_lab
+## Run locally
 
-## Run
+```powershell
 pip install -r requirements.txt
 python seed_admin.py
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
 
 Swagger: http://127.0.0.1:8000/docs
 
-## Demo accounts
-Admin: admin@smartlearninglab.com / ChangeMe123!
-Student: nitin@example.com / Password123!
+## Environment
+
+```env
+MONGODB_URI=mongodb+srv://username:password@smartstudylab.juh84i5.mongodb.net/smart_learning_lab
+JWT_SECRET_KEY=change-this-to-a-long-random-secret
+JWT_EXPIRE_MINUTES=1440
+CORS_ORIGINS=*
+```
+
+No separate MONGODB_DB setting is required. The database is taken from the MongoDB URI.
+
+## Main learner APIs
+
+- `GET /api/v1/dashboard`
+- `GET /api/v1/catalog/categories`
+- `GET /api/v1/catalog/featured`
+- `GET /api/v1/courses?search=&category=&level=&language=`
+- `GET /api/v1/courses/{course_id}`
+- `GET /api/v1/courses/{course_id}/overview`
+- `GET /api/v1/courses/{course_id}/modules`
+- `GET /api/v1/quizzes`
+- `GET /api/v1/quizzes/{quiz_id}/questions`
+- `POST /api/v1/lessons/{lesson_id}/complete`
+- `GET /api/v1/courses/{course_id}/progress`
+- `POST /api/v1/quizzes/{quiz_id}/start`
+- `POST /api/v1/quizzes/{quiz_id}/submit`
 
 ## Admin content model
-Course
-  -> Module / Topic
-      -> Lesson
-          -> progress
-  -> Quiz
-      -> Question Bank questions
 
-Courses support:
-- title/name
-- description and short description
-- category
-- language
-- level
-- learning objectives
-- prerequisites
-- estimated duration
-- thumbnail URL
-- publish/draft
+Course -> Topics/Modules -> Lessons -> Quizzes -> Questions.
 
-Modules support:
-- title/name
-- description
-- learning objectives
-- order
-- estimated minutes
-
-Lessons support:
-- title/name
-- description
-- rich text/content
-- duration
-- resources
-- order
-- publish/draft
-
-Questions support:
-- MCQ options
-- correct answer
-- difficulty
-- marks
-- negative marks
-- explanation
-
-Quizzes support:
-- course/module association
-- duration
-- passing percentage
-- attempts
-- question list
-- publish/draft
-- add existing question
-- create new question directly inside quiz
-
-Student supports:
-- dashboard
-- course discovery
-- enrollment
-- modules/lessons
-- progress
-- quizzes
-- quiz questions
-- attempts/results
-- notes
+Courses also support exam/category, instructor, language, tags, free flag, video/PDF/mock-test counts, featured flag and learning objectives. All of these can be managed from the admin portal; no direct MongoDB editing is required.
