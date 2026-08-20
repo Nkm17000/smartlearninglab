@@ -1,90 +1,44 @@
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, EmailStr, Field
-from datetime import datetime
-
+from fastapi import APIRouter, HTTPException
+from pymongo.errors import DuplicateKeyError
 from app.db.mongo import get_db
-from app.core.security import hash_password, verify_password, create_access_token, get_current_user
-from app.utils import now_utc, serialize_doc
+from app.schemas.common import RegisterRequest, LoginRequest, TokenResponse, UserOut
+from app.core.security import hash_password, verify_password, create_access_token
+import uuid
 
-router = APIRouter(prefix="/auth", tags=["Authentication"])
+router = APIRouter(prefix="/auth", tags=["Auth"])
 
+def user_out(u):
+    return UserOut(id=str(u["_id"]), name=u["name"], email=u["email"], role=u["role"])
 
-class RegisterRequest(BaseModel):
-    name: str = Field(min_length=2, max_length=100)
-    email: EmailStr
-    password: str = Field(min_length=6, max_length=128)
-    mobile: str | None = None
-
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class ProfileUpdate(BaseModel):
-    name: str | None = None
-    mobile: str | None = None
-    profile_image: str | None = None
-
-
-@router.post("/register")
-def register(payload: RegisterRequest):
+@router.post("/register", response_model=TokenResponse)
+def register(data: RegisterRequest):
     db = get_db()
-    email = payload.email.lower()
+    email = data.email.lower()
     if db.users.find_one({"email": email}):
-        raise HTTPException(status_code=409, detail="Email already registered")
-
-    doc = {
-        "name": payload.name.strip(),
+        raise HTTPException(409, "Email already registered")
+    role = "student"  # public registration cannot create admins
+    user = {
+        "_id": uuid.uuid4().hex,
+        "name": data.name,
         "email": email,
-        "mobile": payload.mobile,
-        "passwordHash": hash_password(payload.password),
-        "role": "student",
-        "status": "active",
-        "profileImage": None,
-        "createdAt": now_utc(),
-        "updatedAt": now_utc(),
+        "password_hash": hash_password(data.password),
+        "role": role,
+        "created_at": __import__("datetime").datetime.utcnow(),
     }
-    result = db.users.insert_one(doc)
-    user_id = str(result.inserted_id)
-    token = create_access_token(user_id, "student")
-    doc["_id"] = result.inserted_id
-    doc.pop("passwordHash", None)
-    return {"accessToken": token, "tokenType": "bearer", "user": serialize_doc(doc)}
+    db.users.insert_one(user)
+    return {
+        "access_token": create_access_token(user["_id"], role, email),
+        "token_type": "bearer",
+        "user": user_out(user),
+    }
 
-
-@router.post("/login")
-def login(payload: LoginRequest):
-    db = get_db()
-    user = db.users.find_one({"email": payload.email.lower()})
-    if not user or not verify_password(payload.password, user.get("passwordHash", "")):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    if user.get("status") != "active":
-        raise HTTPException(status_code=403, detail="User account is not active")
-
-    token = create_access_token(str(user["_id"]), user.get("role", "student"))
-    user.pop("passwordHash", None)
-    return {"accessToken": token, "tokenType": "bearer", "user": serialize_doc(user)}
-
-
-@router.get("/me")
-def me(current_user=Depends(get_current_user)):
-    db = get_db()
-    from bson import ObjectId
-    user = db.users.find_one({"_id": ObjectId(current_user["id"])})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.pop("passwordHash", None)
-    return serialize_doc(user)
-
-
-@router.put("/me")
-def update_me(payload: ProfileUpdate, current_user=Depends(get_current_user)):
-    db = get_db()
-    from bson import ObjectId
-    update = {k: v for k, v in payload.model_dump().items() if v is not None}
-    if not update:
-        return me(current_user)
-    update["updatedAt"] = now_utc()
-    db.users.update_one({"_id": ObjectId(current_user["id"])}, {"$set": update})
-    return me(current_user)
+@router.post("/login", response_model=TokenResponse)
+def login(data: LoginRequest):
+    user = get_db().users.find_one({"email": data.email.lower()})
+    if not user or not verify_password(data.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    return {
+        "access_token": create_access_token(str(user["_id"]), user["role"], user["email"]),
+        "token_type": "bearer",
+        "user": user_out(user),
+    }
