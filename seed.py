@@ -1,253 +1,97 @@
-import os
-import sys
-from datetime import datetime, timedelta
+"""Smart Learning Lab full demo seed.
 
-sys.path.insert(0, os.path.dirname(__file__))
+Run from the backend project root:
+    python seed.py
 
+It is idempotent for the main demo records and does not delete existing data.
+"""
+from datetime import datetime, timezone, timedelta
+import uuid
 from app.db.mongo import get_db
 from app.core.security import hash_password
-import uuid
 
+def now(): return datetime.now(timezone.utc)
+def upsert(col,key,doc):
+    db=get_db(); old=db[col].find_one(key)
+    if old:
+        db[col].update_one({'_id':old['_id']},{'$set':{**doc,'updated_at':now()}}); return old['_id']
+    d={'_id':uuid.uuid4().hex,'created_at':now(),'updated_at':now(),**doc}; db[col].insert_one(d); return d['_id']
 
-def oid():
-    return uuid.uuid4().hex
-
-
-def seed():
-    db = get_db()
-
-    # Fresh seed: clears application collections only.
-    collections = [
-        "users",
-        "exams",
-        "subjects",
-        "topics",
-        "courses",
-        "lessons",
-        "questions",
-        "mock_tests",
-        "current_affairs",
-        "progress",
-        "mistakes",
-        "notes",
-        "test_results",
-        "ai_conversations",
-        "ai_messages",
+def main():
+    db=get_db()
+    accounts=[
+      ('Smart Learning Root Admin','admin@smartlearninglab.com','ChangeMe123!','root_admin'),
+      ('Demo Student','nitin@example.com','Password123!','student'),
+      ('Demo Content Admin','content@smartlearninglab.com','Admin123!','content_admin'),
+      ('Demo Instructor','instructor@smartlearninglab.com','Instructor123!','instructor')
     ]
-    for c in collections:
-        db[c].delete_many({})
+    ids={}
+    for name,email,password,role in accounts:
+        ids[email]=upsert('users',{'email':email},{'email':email,'name':name,'password_hash':hash_password(password),'role':role,'is_active':True,'email_verified':True})
+        print(f'{role}: {email} / {password}')
 
-    admin_id = oid()
-    student_id = oid()
-    db.users.insert_many(
-        [
-            {
-                "_id": admin_id,
-                "name": "Admin",
-                "email": "admin@smartlearninglab.com",
-                "password_hash": hash_password("ChangeMe123!"),
-                "role": "admin",
-                "created_at": datetime.utcnow(),
-            },
-            {
-                "_id": student_id,
-                "name": "Nitin",
-                "email": "nitin@example.com",
-                "password_hash": hash_password("Password123!"),
-                "role": "student",
-                "created_at": datetime.utcnow(),
-            },
-        ]
-    )
+    course_id=upsert('courses',{'slug':'english-spoken'},{
+      'slug':'english-spoken','name':'English Spoken','title':'English Spoken Mastery','short_description':'30-day practical spoken English program with conversation, grammar, vocabulary and mock tests.',
+      'description':'Build confident spoken English through guided lessons, practice, revision, adaptive tests and interview-style speaking tasks.',
+      'category':'English','exam':'General','level':'Beginner','language':'English','is_free':True,'is_published':True,'featured':True,
+      'instructor_name':'Smart Learning Lab','estimated_minutes':900,'learning_objectives':['Speak confidently','Improve grammar','Build practical vocabulary','Handle workplace conversations'],'tags':['english','spoken english','communication'],'rating':4.8,'review_count':24,'students_count':1,'video_count':12,'pdf_count':4,'mock_test_count':3})
 
-    exam_id = oid()
-    db.exams.insert_one(
-        {
-            "_id": exam_id,
-            "name": "UPSC Civil Services",
-            "description": "Free foundation preparation for UPSC CSE.",
-            "short_name": "UPSC CSE",
-            "is_published": True,
-            "order": 1,
-        }
-    )
+    modules=[('English Foundations','Greetings, introductions and sentence basics.'),('Daily Conversations','Everyday situations and polite requests.'),('Grammar & Vocabulary','Accuracy, vocabulary and revision.'),('Workplace Communication','Meetings, email and interview communication.')]
+    lesson_ids=[]
+    for mi,(name,desc) in enumerate(modules,1):
+        mid=upsert('topics',{'course_id':str(course_id),'name':name},{'course_id':str(course_id),'name':name,'title':name,'description':desc,'order':mi,'is_published':True})
+        for li in range(1,4):
+            title=f'{name}: Lesson {li}'
+            lid=upsert('lessons',{'topic_id':str(mid),'title':title},{'course_id':str(course_id),'topic_id':str(mid),'title':title,'name':title,'description':f'Practical lesson {li} for {name}.','content':f'{title}. Learn the concept, study examples, practise aloud and complete the lesson quiz.','duration_minutes':15,'order':li,'is_published':True,'video_url':'https://example.com/demo-video','resources':['Practice worksheet','Lesson notes']})
+            lesson_ids.append(lid)
 
-    subjects = []
-    for i, (name, desc) in enumerate(
-        [
-            (
-                "Indian Polity",
-                "Constitution, Parliament, Fundamental Rights and governance.",
-            ),
-            ("Indian History", "Ancient, Medieval and Modern Indian History."),
-            ("Geography", "Physical, Indian and World Geography."),
-            ("Indian Economy", "Basic macroeconomics, banking and public finance."),
-        ],
-        1,
-    ):
-        sid = oid()
-        subjects.append(
-            {
-                "_id": sid,
-                "exam_id": exam_id,
-                "name": name,
-                "description": desc,
-                "is_published": True,
-                "order": i,
-            }
-        )
-    db.subjects.insert_many(subjects)
-
-    topics = []
-    for s in subjects:
-        for j, name in enumerate(
-            {
-                "Indian Polity": ["Constitution", "Fundamental Rights", "Parliament"],
-                "Indian History": ["Modern India", "Freedom Movement"],
-                "Geography": ["Physical Geography", "Indian Geography"],
-                "Indian Economy": ["National Income", "Banking & Monetary Policy"],
-            }[s["name"]],
-            1,
-        ):
-            topics.append(
-                {
-                    "_id": oid(),
-                    "subject_id": s["_id"],
-                    "exam_id": exam_id,
-                    "name": name,
-                    "description": f"{name} fundamentals",
-                    "is_published": True,
-                    "order": j,
-                }
-            )
-    db.topics.insert_many(topics)
-
-    courses = []
-    for t in topics:
-        cid = oid()
-        courses.append(
-            {
-                "_id": cid,
-                "exam_id": exam_id,
-                "subject_id": t["subject_id"],
-                "topic_id": t["_id"],
-                "name": f"{t['name']} Foundation",
-                "description": f"Free course: {t['name']}",
-                "is_published": True,
-                "order": 1,
-            }
-        )
-    db.courses.insert_many(courses)
-
-    lessons = []
-    for c in courses:
-        for j in range(1, 4):
-            lessons.append(
-                {
-                    "_id": oid(),
-                    "course_id": c["_id"],
-                    "name": f"Lesson {j}: {c['name']}",
-                    "content": f"Study notes for {c['name']}. This is sample starter content. Replace with your own licensed/public-domain material.",
-                    "order": j,
-                    "is_published": True,
-                }
-            )
-    db.lessons.insert_many(lessons)
-
-    questions = []
-    sample = [
-        (
-            "Which part of the Constitution deals with Fundamental Rights?",
-            ["Part I", "Part II", "Part III", "Part IV"],
-            2,
-            "Part III contains Fundamental Rights.",
-        ),
-        (
-            "Which institution is the lower house of Parliament?",
-            ["Rajya Sabha", "Lok Sabha", "Supreme Court", "NITI Aayog"],
-            1,
-            "Lok Sabha is the lower house.",
-        ),
-        (
-            "Which gas is most abundant in Earth's atmosphere?",
-            ["Oxygen", "Nitrogen", "Carbon dioxide", "Hydrogen"],
-            1,
-            "Nitrogen is the most abundant gas.",
-        ),
-        (
-            "Which body controls monetary policy in India?",
-            ["SEBI", "RBI", "CAG", "UPSC"],
-            1,
-            "The RBI is India's central bank and conducts monetary policy.",
-        ),
+    qs=[
+      ('Which sentence is correct?',['I work in Jaipur.','I works in Jaipur.','I working Jaipur.','I am work Jaipur.'],0,'easy'),
+      ('Choose the best morning greeting.',['Good morning!','Good night!','Goodbye!','See you yesterday!'],0,'easy'),
+      ('Choose the correct question.',['How much is this?','How much this is?','How this much is?','This is how much?'],0,'easy'),
+      ('Complete: She ___ in Jaipur.',['work','works','working','worked'],1,'medium'),
+      ('Which sentence uses present perfect correctly?',['I have finished the work.','I have finish the work.','I finished have the work.','I has finished the work.'],0,'medium'),
+      ('Which is most appropriate in a professional meeting?',['Could you please clarify that?','You explain now!','What you saying?','Tell again quickly!'],0,'hard'),
     ]
-    for i, (q, opts, ans, exp) in enumerate(sample):
-        topic = topics[i % len(topics)]
-        questions.append(
-            {
-                "_id": oid(),
-                "exam_id": exam_id,
-                "subject_id": topic["subject_id"],
-                "topic_id": topic["_id"],
-                "question": q,
-                "options": opts,
-                "answer": ans,
-                "explanation": exp,
-                "difficulty": "easy",
-                "is_published": True,
-            }
-        )
-    db.questions.insert_many(questions)
+    qids=[]
+    for qtext,opts,ans,diff in qs:
+        qid=upsert('questions',{'question':qtext},{'course_id':str(course_id),'topic_id':None,'question':qtext,'type':'mcq','options':opts,'correct_answer':ans,'answer':ans,'difficulty':diff,'marks':1,'negative_marks':0,'explanation':'Review the grammar and communication rule behind the correct option.','tags':['english',diff],'is_published':True})
+        qids.append(str(qid))
 
-    test_id = oid()
-    db.mock_tests.insert_one(
-        {
-            "_id": test_id,
-            "exam_id": exam_id,
-            "name": "UPSC Foundation Mini Test",
-            "description": "Starter 4-question mock test",
-            "question_ids": [q["_id"] for q in questions],
-            "questions": questions,
-            "duration_minutes": 10,
-            "is_published": True,
-        }
-    )
+    quiz_id=upsert('quizzes',{'course_id':str(course_id),'title':'English Adaptive Mock Test'},{'course_id':str(course_id),'title':'English Adaptive Mock Test','name':'English Adaptive Mock Test','description':'Practice test used by the demo student for results and adaptive learning.','duration_minutes':20,'passing_percentage':60,'max_attempts':5,'question_ids':qids,'is_published':True,'featured':True})
+    db.courses.update_one({'_id':course_id},{'$set':{'mock_test_count':1}})
 
-    now = datetime.utcnow()
-    db.current_affairs.insert_many(
-        [
-            {
-                "_id": oid(),
-                "title": "How to use the Constitution in exam preparation",
-                "content": "Starter current-affairs-style learning note. Replace with verified current content.",
-                "category": "National",
-                "date": now,
-                "is_published": True,
-            },
-            {
-                "_id": oid(),
-                "title": "Understanding monetary policy",
-                "content": "Starter economy learning note for beginners.",
-                "category": "Economy",
-                "date": now - timedelta(days=1),
-                "is_published": True,
-            },
-        ]
-    )
+    student=str(ids['nitin@example.com'])
+    # Enrollment and progress
+    upsert('enrollments',{'user_id':student,'course_id':str(course_id)},{'user_id':student,'course_id':str(course_id),'status':'active','created_at':now()})
+    for lid in lesson_ids[:4]:
+        upsert('progress',{'user_id':student,'lesson_id':str(lid)},{'user_id':student,'course_id':str(course_id),'lesson_id':str(lid),'completed':True,'completed_at':now(),'updated_at':now()})
+        upsert('video_progress',{'user_id':student,'lesson_id':str(lid)},{'user_id':student,'lesson_id':str(lid),'seconds':900,'duration_seconds':900,'completed':True,'updated_at':now()})
 
-    print("Seed completed.")
-    print("Database:", db.name)
-    print("Admin: admin@smartlearninglab.com / ChangeMe123!")
-    print("Student: nitin@example.com / Password123!")
-    print("Users:", db.users.count_documents({}))
-    print("Exams:", db.exams.count_documents({}))
-    print("Subjects:", db.subjects.count_documents({}))
-    print("Topics:", db.topics.count_documents({}))
-    print("Courses:", db.courses.count_documents({}))
-    print("Lessons:", db.lessons.count_documents({}))
-    print("Questions:", db.questions.count_documents({}))
-    print("Mock tests:", db.mock_tests.count_documents({}))
+    # Sample quiz attempt
+    attempt_id=upsert('test_attempts',{'user_id':student,'test_id':str(quiz_id),'status':'submitted'},{'user_id':student,'test_id':str(quiz_id),'status':'submitted','started_at':now()-timedelta(minutes=18),'submitted_at':now(),'result':{'score':5,'total':6,'percentage':83.33,'passed':True,'correct_count':5,'wrong_count':1}})
 
+    # Flashcards
+    for front,back in [('Present perfect','have/has + past participle'),('Could you please...?','Polite request used in professional communication.'),('Accomplish','To successfully complete something.')]:
+        upsert('flashcards',{'user_id':student,'front':front},{'user_id':student,'front':front,'back':back,'course_id':str(course_id),'ease':2.5,'interval_days':1,'repetitions':0,'due_at':now()})
 
-if __name__ == "__main__":
-    seed()
+    # Community
+    post_id=upsert('community_posts',{'user_id':student,'title':'How can I improve speaking fluency?'},{'user_id':student,'author_name':'Demo Student','title':'How can I improve speaking fluency?','content':'I can write English fairly well. What daily routine would you recommend for speaking practice?','course_id':str(course_id),'likes':3,'status':'active'})
+    upsert('community_comments',{'post_id':str(post_id),'user_id':str(ids['instructor@smartlearninglab.com'])},{'post_id':str(post_id),'user_id':str(ids['instructor@smartlearninglab.com']),'author_name':'Demo Instructor','content':'Try 10 minutes of speaking aloud every day and review your mistakes after each practice session.'})
+
+    # Activity for analytics
+    for i,event in enumerate(['course_view','lesson_completed','quiz_completed','flashcard_review','speaking_practice']):
+        db.activity_events.insert_one({'_id':uuid.uuid4().hex,'user_id':student,'event':event,'course_id':str(course_id),'created_at':now()-timedelta(days=i)})
+
+    # Course resources
+    for i,lid in enumerate(lesson_ids[:3]):
+        upsert('lesson_resources',{'lesson_id':str(lid),'title':'Study Notes'},{'lesson_id':str(lid),'title':'Study Notes','url':'https://example.com/study-notes.pdf','type':'pdf','duration_seconds':0,'order':i})
+
+    print('\nDemo content ready.')
+    print('Root Admin: admin@smartlearninglab.com / ChangeMe123!')
+    print('Student:    nitin@example.com / Password123!')
+    print('Content Admin: content@smartlearninglab.com / Admin123!')
+    print('Instructor: instructor@smartlearninglab.com / Instructor123!')
+    print('Course:',course_id,'Quiz:',quiz_id)
+
+if __name__=='__main__': main()

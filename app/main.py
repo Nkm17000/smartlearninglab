@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import admin, ai, auth, learning, growth, advanced
+from app.api import admin, ai, auth, learning, growth, advanced, features
 from app.core.config import get_settings
 from app.db.mongo import close, ping
 
@@ -21,6 +21,7 @@ app.include_router(admin.router)
 app.include_router(ai.router)
 app.include_router(growth.router)
 app.include_router(advanced.router)
+app.include_router(features.router)
 
 @app.get("/")
 def root(): return {"name":"Smart Learning Lab API","version":"4.0.0","docs":"/docs"}
