@@ -7,8 +7,10 @@ import uuid
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
+
 def user_out(u):
     return UserOut(id=str(u["_id"]), name=u["name"], email=u["email"], role=u["role"])
+
 
 @router.post("/register", response_model=TokenResponse)
 def register(data: RegisterRequest):
@@ -32,13 +34,16 @@ def register(data: RegisterRequest):
         "user": user_out(user),
     }
 
+
 @router.post("/login", response_model=TokenResponse)
 def login(data: LoginRequest):
     user = get_db().users.find_one({"email": data.email.lower()})
     if not user or not verify_password(data.password, user["password_hash"]):
         raise HTTPException(401, "Invalid email or password")
     return {
-        "access_token": create_access_token(str(user["_id"]), user["role"], user["email"]),
+        "access_token": create_access_token(
+            str(user["_id"]), user["role"], user["email"]
+        ),
         "token_type": "bearer",
         "user": user_out(user),
     }

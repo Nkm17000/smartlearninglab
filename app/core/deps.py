@@ -5,6 +5,7 @@ from app.db.mongo import get_db
 
 bearer = HTTPBearer(auto_error=False)
 
+
 def current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer),
 ):
@@ -18,6 +19,7 @@ def current_user(
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
+
 
 def require_admin(user=Depends(current_user)):
     if user.get("role") != "admin":

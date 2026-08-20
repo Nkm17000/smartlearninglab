@@ -1,7 +1,5 @@
 from functools import lru_cache
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 class Settings(BaseSettings):
     mongodb_uri: str
@@ -18,7 +16,6 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [x.strip() for x in self.cors_origins.split(",") if x.strip()]
-
 
 @lru_cache
 def get_settings() -> Settings:
