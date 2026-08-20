@@ -93,5 +93,6 @@ def main():
     print('Content Admin: content@smartlearninglab.com / Admin123!')
     print('Instructor: instructor@smartlearninglab.com / Instructor123!')
     print('Course:',course_id,'Quiz:',quiz_id)
+    
 
 if __name__=='__main__': main()
