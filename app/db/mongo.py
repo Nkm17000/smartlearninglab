@@ -1,35 +1,46 @@
+from functools import lru_cache
+
 from pymongo import MongoClient
-from pymongo.database import Database
 
 from app.core.config import get_settings
 
-_client: MongoClient | None = None
 
-
+@lru_cache
 def get_client() -> MongoClient:
-    global _client
-    if _client is None:
-        settings = get_settings()
-        _client = MongoClient(
-            settings.mongodb_uri,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
-            socketTimeoutMS=10000,
-        )
-    return _client
+    settings = get_settings()
+
+    return MongoClient(
+        settings.mongodb_uri,
+        serverSelectionTimeoutMS=10000,
+    )
 
 
-def get_db() -> Database:
-    return get_client()[get_settings().mongodb_db]
+def get_db():
+    """
+    Return the default MongoDB database from the URI.
+
+    Example:
+        mongodb+srv://user:password@cluster.mongodb.net/smart_learning_lab
+
+    get_default_database() will return:
+        smart_learning_lab
+    """
+    client = get_client()
+
+    db = client.get_default_database()
+
+    return db
 
 
-def ping() -> bool:
-    get_client().admin.command("ping")
-    return True
+def get_database():
+    """
+    Backward-compatible alias.
+    """
+    return get_db()
 
 
-def close() -> None:
-    global _client
-    if _client is not None:
-        _client.close()
-        _client = None
+def close_mongo_connection():
+    """
+    Close the MongoDB client.
+    """
+    get_client().close()

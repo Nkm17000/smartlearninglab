@@ -1,4 +1,5 @@
 from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,23 +9,31 @@ class Settings(BaseSettings):
     debug: bool = True
     api_prefix: str = "/api/v1"
 
-    mongodb_uri: str = "mongodb://127.0.0.1:27017"
-    mongodb_db: str = "smart_learning_lab"
+    # MongoDB
+    #
+    # IMPORTANT:
+    # Put the database name directly in the URI:
+    #
+    # mongodb+srv://USER:PASSWORD@HOST/smart_learning_lab
+    #
+    # This prevents the application from accidentally selecting
+    # a wrongly named database.
+    mongodb_uri: str
 
-    jwt_secret_key: str = "CHANGE_ME"
+    # JWT
+    jwt_secret_key: str
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
 
-    cors_origins: str = "http://localhost:8081,http://localhost:19006,http://localhost:3000"
+    # CORS
+    cors_origins: str = "*"
 
-    admin_email: str = "admin@smartlearninglab.com"
-    admin_password: str = "ChangeMe123!"
-
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
-
-    @property
-    def cors_origin_list(self) -> list[str]:
-        return [x.strip() for x in self.cors_origins.split(",") if x.strip()]
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
 
 @lru_cache

@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
 from pymongo import MongoClient
 from app.core.config import get_settings
+from app.db.mongo import get_db
 from app.core.security import hash_password
 
 settings = get_settings()
-client = MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=5000)
-db = client[settings.mongodb_db]
+db = get_db()
 now = datetime.now(timezone.utc)
 
 # Categories
@@ -78,4 +78,3 @@ db.users.update_one(
 print("Seed completed.")
 print("Admin email:", admin_email)
 print("Admin password: value from ADMIN_PASSWORD in .env")
-client.close()
