@@ -1,0 +1,11 @@
+{
+  "expo": {
+    "name": "Smart Learning Lab",
+    "slug": "smart-learning-lab",
+    "version": "1.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "web": { "bundler": "metro" },
+    "android": { "package": "com.smartlearninglab.app" }
+  }
+}

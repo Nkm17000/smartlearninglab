@@ -83,39 +83,56 @@ def generate_and_save_quiz(data:dict, user=Depends(admin_user)):
     return {'quiz_id':qid,'question_ids':qids,'message':'AI quiz draft saved. Review questions before publishing.'}
 
 # ---------------- RAG Tutor ----------------
-def tokenize(text): return set(re.findall(r'[a-zA-Z0-9]{3,}',(text or '').lower()))
-def retrieve(query, course_id=None, limit=5):
-    db=get_db(); qtokens=tokenize(query); docs=[]
+def tokenize(text):
+    return [x for x in re.findall(r"[a-zA-Z0-9+#.]{2,}", (text or "").lower())]
+
+def retrieve(query, course_id=None, limit=8):
+    db=get_db(); qtokens=tokenize(query); qset=set(qtokens); docs=[]
     filt={'is_published':True}
     if course_id: filt['course_id']=course_id
-    for l in db.lessons.find(filt):
-        txt=' '.join(str(l.get(k,'')) for k in ('title','description','content'))
-        overlap=len(qtokens & tokenize(txt));
-        if overlap: docs.append((overlap,l))
-    docs.sort(key=lambda x:x[0],reverse=True)
-    return [d for _,d in docs[:limit]]
+    for collection in ('lessons','lesson_resources','courses'):
+        for d in db[collection].find(filt).limit(1500):
+            fields=('title','name','description','content','text','topic','tags')
+            text=' '.join(str(d.get(k,'')) for k in fields)
+            tokens=tokenize(text); token_set=set(tokens)
+            overlap=len(qset & token_set)
+            phrase_bonus=2 if query.lower() in text.lower() else 0
+            title_bonus=sum(2 for tok in qset if tok in str(d.get('title') or d.get('name') or '').lower())
+            score=overlap*3+phrase_bonus+title_bonus
+            if score>0: docs.append((score,d,collection,text))
+    docs.sort(key=lambda x:(-x[0], str(x[1].get('title') or x[1].get('name') or '')))
+    return docs[:limit]
 
-def llm_answer(question, contexts):
-    key=os.getenv('OPENAI_API_KEY')
-    if not key: return None
-    model=os.getenv('OPENAI_MODEL','gpt-4o-mini')
-    body=json.dumps({'model':model,'messages':[{'role':'system','content':'Answer only from the supplied study context. If context is insufficient, say so.'},{'role':'user','content':f'Context:\n{contexts}\n\nQuestion: {question}'}]}).encode()
-    req=urllib.request.Request('https://api.openai.com/v1/chat/completions',data=body,headers={'Content-Type':'application/json','Authorization':f'Bearer {key}'},method='POST')
-    try:
-        with urllib.request.urlopen(req,timeout=25) as r: return json.loads(r.read()).get('choices',[{}])[0].get('message',{}).get('content')
-    except Exception: return None
+def _fallback_answer(question, docs):
+    if not docs:
+        return ("I couldn't find this topic in your published learning material. "
+                "Try asking about a course, lesson, or concept that exists in Smart Learning Lab, "
+                "or select a course so I can answer from its material.")
+    best=[]
+    for _,d,collection,text in docs[:4]:
+        title=d.get('title') or d.get('name') or 'Learning material'
+        body=(d.get('content') or d.get('description') or text).strip()
+        best.append(f"{title}: {body[:650]}")
+    return "Based on your learning material:\n\n" + "\n\n".join(best) + "\n\nIf you want, ask me to explain, give an example, or create practice questions from this topic."
 
 @router.post('/ai/tutor/rag')
 def rag_tutor(data:dict,user=Depends(current_user)):
-    question=(data.get('question') or data.get('message') or '').strip()
+    question=str(data.get('question') or data.get('message') or '').strip()
     if not question: raise HTTPException(422,'question is required')
-    docs=retrieve(question,data.get('course_id'),5)
-    contexts='\n\n'.join(f"{d.get('title')}: {d.get('content') or d.get('description','')}" for d in docs)
-    answer=llm_answer(question,contexts)
-    if not answer:
-        if docs: answer='Based on your course material:\n\n'+'\n\n'.join(f"• {d.get('title')}: {d.get('content') or d.get('description','')}" for d in docs[:3])
-        else: answer='I could not find enough matching material in the course knowledge base. Try asking about a specific lesson or topic.'
-    return {'answer':answer,'sources':[{'lesson_id':str(d['_id']),'title':d.get('title'),'snippet':(d.get('content') or d.get('description',''))[:220]} for d in docs]}
+    docs=retrieve(question,data.get('course_id'),8)
+    context='\n\n'.join(f"SOURCE {i+1}: {d.get('title') or d.get('name') or 'Material'}\n{(d.get('content') or d.get('description') or text)[:1800]}" for i,(_,d,_,text) in enumerate(docs))
+    from app.services.ai_service import chat, configured
+    history=data.get('history') or []
+    system=("You are Smart Learning Lab AI Study Tutor. Answer the user's exact question, not a guessed question. "
+            "Use the supplied learning context as the primary source. If the context does not contain the answer, say that clearly and then give a short general explanation only if it is safe and useful. "
+            "Do not invent course facts. Structure answers with a direct answer first, then explanation, examples when useful, and a short next step. "
+            "If the user asks for code, provide code. If they ask a definition, define it. If they ask a comparison, compare it. "
+            "Keep the response appropriate for a learner and directly relevant to the user's wording.")
+    prompt=f"LEARNING CONTEXT:\n{context or 'No matching course context was found.'}\n\nUSER QUESTION:\n{question}"
+    answer=chat(system,prompt,history=history,temperature=0.15) if configured() else None
+    if not answer: answer=_fallback_answer(question,docs)
+    sources=[{'lesson_id':str(d.get('_id')),'title':d.get('title') or d.get('name') or 'Material','snippet':(d.get('content') or d.get('description') or text)[:240],'type':collection,'score':score} for score,d,collection,text in docs]
+    return {'answer':answer.strip(),'sources':sources,'grounded':bool(docs),'provider':'llm' if configured() and answer else 'retrieval','query':question}
 
 # ---------------- Speaking Practice ----------------
 @router.post('/ai/speaking/evaluate')

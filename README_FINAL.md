@@ -1,66 +1,48 @@
-# Smart Learning Lab — Final Platform Backend
+# Smart Learning Lab — Final Platform Frontend
 
-This release extends the previous platform with the remaining platform foundation:
+The frontend keeps the existing course/admin/student experience and adds:
 
-- lesson resource/video/PDF URL management
-- video watch-position tracking and completion
-- richer question-type validation
-- test attempt history and review
-- gamification endpoint (XP, level, badges)
-- Expo/device-token registration for push infrastructure
-- email verification token workflow
-- course-grounded retrieval tutor endpoint
-- speaking-practice evaluation from transcript (STT provider can be connected separately)
-- detailed admin operational analytics
-- admin audit-log read endpoint
-
-## Environment
-
-Keep the existing MongoDB-only configuration. No separate MongoDB database variable is required:
-
-`MONGODB_URI=mongodb+srv://.../smart_learning_lab`
-
-Optional AI/provider, SMTP, OAuth and push credentials from the existing `.env.example` remain supported.
+- AI tutor grounded retrieval workflow
+- AI speaking-practice screen
+- watch/resource API support
+- gamification API support
+- email verification API support
+- device-token API support
+- richer test attempt APIs
+- detailed admin analytics API support
 
 ## Start
 
 ```powershell
-pip install -r requirements.txt
-python seed_admin.py
-python seed_demo.py
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+npm install
+npx expo start -c
 ```
 
-## Important production integrations
+Set:
 
-The backend deliberately keeps external vendor credentials optional. The retrieval tutor works without a paid LLM by returning course-grounded source snippets. To produce generated answers, connect your preferred LLM provider inside `app/api/advanced.py`.
+`EXPO_PUBLIC_API_BASE_URL=http://127.0.0.1:8000/api/v1`
 
-The speaking endpoint evaluates a transcript. Connect an STT service (for example an Expo-compatible speech-to-text provider) to turn microphone audio into a transcript before calling `/api/v1/speaking/evaluate`.
+For a deployed backend, replace it with the deployed API base URL.
 
-Push-token registration is included; sending push notifications requires an Expo push service worker/job or another push provider.
+## AI Intelligence Upgrade
 
-## Feature-complete release
+This version adds a new AI-first product layer:
 
-This release explicitly includes:
-1. AI Course Generator
-2. AI Quiz Generator
-3. AI Tutor + lexical RAG with optional OpenAI provider
-4. AI Speaking Practice evaluation
-5. Personalized Learning Path
-6. Adaptive Tests
-7. Flashcards + spaced repetition
-8. Advanced student/admin analytics
-9. Interview Preparation
-10. Community posts, comments and likes
+- AI Personal Learning Coach
+- AI-generated personalized quizzes
+- AI Study Plan generator
+- PDF to AI course blueprint and draft-course saving
+- At-risk student detection for admins
+- Career / skill roadmap
+- AI mock interview and answer evaluation
+- AI Course Health Checker
+- Global semantic-style search across courses, lessons and questions
+- Offline lesson-completion queue with server sync
 
-### Demo seed
-Run `python seed.py` to create/update demo users, an English course, lessons, quizzes, progress, flashcards, community content and analytics activity.
+### New routes
 
-Optional AI provider:
-`OPENAI_API_KEY=...`
-`OPENAI_MODEL=gpt-4o-mini`
-Without a provider key, the course/quiz generators and tutor use deterministic/local behavior so the workflows can still be tested.
+Student: `/api/v1/ai/coach`, `/api/v1/ai/personalized-quiz`, `/api/v1/ai/study-plan`, `/api/v1/career/roadmap`, `/api/v1/ai/mock-interview`, `/api/v1/ai/mock-interview/evaluate`, `/api/v1/search`, `/api/v1/offline/sync`
 
-## Video review fixes
+Admin: `/api/v1/admin/ai/course-from-pdf`, `/api/v1/admin/ai/course-from-pdf/save`, `/api/v1/admin/students/at-risk`, `/api/v1/admin/courses/{course_id}/health`
 
-The student home now receives enrolled-course progress from `/api/v1/dashboard`, and course overview lessons include their `lesson_resources`. These changes prevent the FE from showing an incomplete course card when progress/resource data exists in MongoDB.
+The mobile app now exposes **AI Studio** for students and **AI Intelligence** for admins.
