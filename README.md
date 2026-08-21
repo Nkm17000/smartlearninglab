@@ -1,34 +1,20 @@
-# Smart Learning Lab – Final Platform
-
-This release includes the complete free-learning platform foundation:
-
-- Student registration/login
-- Forgot/reset password email flow
-- Google/GitHub OAuth hooks
-- Root admin and role-based staff management
-- Course → topics → lessons → quizzes → questions
-- Enrollment and learning progress
-- Course search and discovery
-- Test series and quiz attempts
-- Student analytics, XP, levels and streaks
-- Leaderboard and badges
-- Bookmarks, notes and course reviews
-- Notifications
-- Course completion certificates + PDF endpoint
-- Admin dashboard and platform analytics
-- AI Tutor/conversation APIs from the existing project
-
-## Environment
-
-`MONGODB_URI` must include the database name. No separate MongoDB database parameter is required.
-
-See `.env.example` for SMTP and OAuth settings.
+# Smart Learning Lab Backend
 
 ## Run
-
-```powershell
+```bash
 pip install -r requirements.txt
-python seed_admin.py
-python seed_demo.py
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+copy .env.example .env
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+## AI configuration
+Set `AI_API_KEY` + `AI_BASE_URL` + `AI_MODEL` in `.env` for generative AI. Groq-compatible configuration is also supported with `GROQ_API_KEY` and `GROQ_MODEL`.
+
+Important AI endpoints:
+- POST `/api/v1/ai/tutor/rag`
+- GET `/api/v1/ai/coach`
+- POST `/api/v1/ai/personalized-quiz`
+- POST `/api/v1/ai/study-plan`
+- GET `/api/v1/career/roadmap`
+- POST `/api/v1/ai/mock-interview`
+- GET `/api/v1/search`

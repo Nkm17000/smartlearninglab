@@ -1,0 +1,11 @@
+import React,{useState} from 'react';
+import {Alert,Text,View} from 'react-native';
+import {AppShell,Button,Card,Header,Loading,Badge} from '../../components/UI';
+import {api} from '../../services/api';
+import {colors} from '../../theme';
+export default function AdaptiveTestScreen(){
+ const [test,setTest]=useState(null),[answers,setAnswers]=useState({}),[result,setResult]=useState(null),[busy,setBusy]=useState(false);
+ const start=async()=>{setBusy(true);try{setTest(await api.adaptiveTest({count:10}));setAnswers({});setResult(null)}catch(e){Alert.alert('Adaptive test',e.message)}finally{setBusy(false)}};
+ const submit=async()=>{setBusy(true);try{setResult(await api.adaptiveSubmit({questions:test.questions,answers}))}catch(e){Alert.alert('Adaptive test',e.message)}finally{setBusy(false)}};
+ return <AppShell><Header eyebrow="Adaptive practice" title="Adaptive Test" subtitle="Question difficulty adapts to your recent performance."/>{!test?<Card><Text style={{fontSize:18,fontWeight:'900',color:colors.navy}}>Ready for a personalized test?</Text><Text style={{color:colors.muted,marginTop:7}}>10 questions are selected around your current level.</Text><View style={{marginTop:14}}><Button title={busy?'Preparing...':'Start adaptive test'} onPress={start} disabled={busy}/></View></Card>:<>{test.questions.map((q,i)=><Card key={api.idOf(q)||i}><View style={{flexDirection:'row',justifyContent:'space-between'}}><Badge tone="orange">{q.difficulty||test.adaptive_level}</Badge><Text style={{color:colors.muted}}>Q{i+1}</Text></View><Text style={{fontSize:17,fontWeight:'900',color:colors.navy,marginTop:10}}>{q.question||q.text}</Text><View style={{marginTop:10,gap:7}}>{(q.options||[]).map((o,j)=><Button key={j} title={String(o)} variant={String(answers[api.idOf(q)])===String(j)?'primary':'secondary'} onPress={()=>setAnswers(a=>({...a,[api.idOf(q)]:j}))}/>)}</View></Card>)}<Button title={busy?'Submitting...':'Submit adaptive test'} onPress={submit} disabled={busy}/>{result&&<Card style={{marginTop:14}}><Text style={{fontSize:24,fontWeight:'900',color:colors.primary}}>{result.percentage}%</Text><Text style={{fontWeight:'900',marginTop:5}}>{result.passed?'Passed':'Keep practising'}</Text><Text style={{color:colors.muted,marginTop:5}}>Next recommended level: {result.next_level}</Text></Card>}</>}</AppShell>
+}

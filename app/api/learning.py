@@ -74,66 +74,25 @@ def profile(user=Depends(current_user)):
     return {"id": uid(user), "name": user.get("name",""), "email": user.get("email",""), "role": user.get("role","student"), "is_active": user.get("is_active",True)}
 
 @router.get("/courses")
-def courses(
-    search: str | None = None,
-    category: str | None = None,
-    level: str | None = None,
-    language: str | None = None,
-    free_only: bool = False,
-    user=Depends(current_user),
-):
-    db = get_db()
-
-    # Base query
-    q = {
-        "is_published": True
-    }
-
-    # Search
+def courses(search: str | None = None, category: str | None = None, level: str | None = None, language: str | None = None, free_only: bool = True, user=Depends(current_user)):
+    q = {"is_published": True}
     if search:
         q["$or"] = [
-            {"name": {"$regex": search, "$options": "i"}},
-            {"title": {"$regex": search, "$options": "i"}},
-            {"description": {"$regex": search, "$options": "i"}},
+            {"name":{"$regex":search,"$options":"i"}},
+            {"title":{"$regex":search,"$options":"i"}},
+            {"description":{"$regex":search,"$options":"i"}},
+            {"exam":{"$regex":search,"$options":"i"}},
+            {"tags":{"$regex":search,"$options":"i"}},
         ]
-
-    # Filters
-    if category:
-        q["category"] = {
-            "$regex": category,
-            "$options": "i"
-        }
-
-    if level:
-        q["level"] = {
-            "$regex": level,
-            "$options": "i"
-        }
-
-    if language:
-        q["language"] = {
-            "$regex": language,
-            "$options": "i"
-        }
-
-    # IMPORTANT:
-    # Never use "$or_free".
-    # "is_free" is a normal MongoDB field.
-    if free_only:
-        q["is_free"] = True
-
-    cursor = (
-        db.courses
-        .find(q)
-        .sort([
-            ("featured", -1),
-            ("created_at", -1)
-        ])
-    )
-
-    items = [clean(course) for course in cursor]
-
+    if category: q["category"] = {"$regex":category,"$options":"i"}
+    if level: q["level"] = {"$regex":level,"$options":"i"}
+    if language: q["language"] = {"$regex":language,"$options":"i"}
+    if free_only: q["is_free"] = True
+    # Mongo cannot use a synthetic key; free courses are the default in this free app.
+    if "or_free" in q: q.pop("or_free", None)
+    items=[clean(x) for x in get_db().courses.find(q).sort([("featured",-1),("created_at",-1)])]
     return items
+
 @router.get("/catalog/categories")
 def catalog_categories(user=Depends(current_user)):
     db=get_db()

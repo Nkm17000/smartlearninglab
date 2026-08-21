@@ -1,0 +1,11 @@
+import React,{useState} from 'react';
+import {Alert,Text,TextInput,View} from 'react-native';
+import {AppShell,Button,Card,Header,Select,Badge} from '../../components/UI';
+import {api} from '../../services/api';
+import {colors} from '../../theme';
+export default function InterviewPrepScreen(){
+ const [topic,setTopic]=useState('java'),[session,setSession]=useState(null),[idx,setIdx]=useState(0),[answer,setAnswer]=useState(''),[result,setResult]=useState(null),[busy,setBusy]=useState(false);
+ const start=async()=>{try{setSession(await api.interviewSession({topic,count:5}));setIdx(0);setAnswer('');setResult(null)}catch(e){Alert.alert('Interview',e.message)}};
+ const evaluate=async()=>{setBusy(true);try{setResult(await api.interviewEvaluate({answer}));}catch(e){Alert.alert('Interview',e.message)}finally{setBusy(false)}};
+ return <AppShell><Header eyebrow="Career" title="Interview Preparation" subtitle="Practice technical and behavioral questions with instant structured feedback."/><Card><Select label="Track" value={topic} onChange={setTopic} options={['java','spring','ai','general'].map(x=>({label:x.toUpperCase(),value:x}))}/><Button title="Start interview session" onPress={start}/></Card>{session&&<Card><Badge tone="purple">Question {idx+1} / {session.questions.length}</Badge><Text style={{fontSize:20,fontWeight:'900',color:colors.navy,marginTop:12}}>{session.questions[idx]}</Text><TextInput value={answer} onChangeText={setAnswer} multiline placeholder="Type your answer..." style={{borderWidth:1,borderColor:colors.border,borderRadius:12,padding:12,minHeight:130,marginTop:14,color:colors.text}}/><View style={{flexDirection:'row',gap:8,marginTop:10,flexWrap:'wrap'}}><Button title={busy?'Evaluating...':'Evaluate answer'} onPress={evaluate} disabled={busy||!answer.trim()}/>{idx<session.questions.length-1&&<Button title="Next question" variant="secondary" onPress={()=>{setIdx(idx+1);setAnswer('');setResult(null)}}/>}</View>{result&&<View style={{marginTop:16}}><Text style={{fontSize:22,fontWeight:'900',color:colors.primary}}>Score {result.score}%</Text>{result.strengths.map((x,i)=><Text key={i} style={{marginTop:7}}>✓ {x}</Text>)}{result.improvements.map((x,i)=><Text key={i} style={{marginTop:7,color:colors.muted}}>• {x}</Text>)}</View>}</Card>}</AppShell>
+}
