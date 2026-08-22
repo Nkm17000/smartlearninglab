@@ -83,56 +83,39 @@ def generate_and_save_quiz(data:dict, user=Depends(admin_user)):
     return {'quiz_id':qid,'question_ids':qids,'message':'AI quiz draft saved. Review questions before publishing.'}
 
 # ---------------- RAG Tutor ----------------
-def tokenize(text):
-    return [x for x in re.findall(r"[a-zA-Z0-9+#.]{2,}", (text or "").lower())]
-
-def retrieve(query, course_id=None, limit=8):
-    db=get_db(); qtokens=tokenize(query); qset=set(qtokens); docs=[]
+def tokenize(text): return set(re.findall(r'[a-zA-Z0-9]{3,}',(text or '').lower()))
+def retrieve(query, course_id=None, limit=5):
+    db=get_db(); qtokens=tokenize(query); docs=[]
     filt={'is_published':True}
     if course_id: filt['course_id']=course_id
-    for collection in ('lessons','lesson_resources','courses'):
-        for d in db[collection].find(filt).limit(1500):
-            fields=('title','name','description','content','text','topic','tags')
-            text=' '.join(str(d.get(k,'')) for k in fields)
-            tokens=tokenize(text); token_set=set(tokens)
-            overlap=len(qset & token_set)
-            phrase_bonus=2 if query.lower() in text.lower() else 0
-            title_bonus=sum(2 for tok in qset if tok in str(d.get('title') or d.get('name') or '').lower())
-            score=overlap*3+phrase_bonus+title_bonus
-            if score>0: docs.append((score,d,collection,text))
-    docs.sort(key=lambda x:(-x[0], str(x[1].get('title') or x[1].get('name') or '')))
-    return docs[:limit]
+    for l in db.lessons.find(filt):
+        txt=' '.join(str(l.get(k,'')) for k in ('title','description','content'))
+        overlap=len(qtokens & tokenize(txt));
+        if overlap: docs.append((overlap,l))
+    docs.sort(key=lambda x:x[0],reverse=True)
+    return [d for _,d in docs[:limit]]
 
-def _fallback_answer(question, docs):
-    if not docs:
-        return ("I couldn't find this topic in your published learning material. "
-                "Try asking about a course, lesson, or concept that exists in Smart Learning Lab, "
-                "or select a course so I can answer from its material.")
-    best=[]
-    for _,d,collection,text in docs[:4]:
-        title=d.get('title') or d.get('name') or 'Learning material'
-        body=(d.get('content') or d.get('description') or text).strip()
-        best.append(f"{title}: {body[:650]}")
-    return "Based on your learning material:\n\n" + "\n\n".join(best) + "\n\nIf you want, ask me to explain, give an example, or create practice questions from this topic."
+def llm_answer(question, contexts):
+    key=os.getenv('OPENAI_API_KEY')
+    if not key: return None
+    model=os.getenv('OPENAI_MODEL','gpt-4o-mini')
+    body=json.dumps({'model':model,'messages':[{'role':'system','content':'Answer only from the supplied study context. If context is insufficient, say so.'},{'role':'user','content':f'Context:\n{contexts}\n\nQuestion: {question}'}]}).encode()
+    req=urllib.request.Request('https://api.openai.com/v1/chat/completions',data=body,headers={'Content-Type':'application/json','Authorization':f'Bearer {key}'},method='POST')
+    try:
+        with urllib.request.urlopen(req,timeout=25) as r: return json.loads(r.read()).get('choices',[{}])[0].get('message',{}).get('content')
+    except Exception: return None
 
 @router.post('/ai/tutor/rag')
 def rag_tutor(data:dict,user=Depends(current_user)):
-    question=str(data.get('question') or data.get('message') or '').strip()
+    question=(data.get('question') or data.get('message') or '').strip()
     if not question: raise HTTPException(422,'question is required')
-    docs=retrieve(question,data.get('course_id'),8)
-    context='\n\n'.join(f"SOURCE {i+1}: {d.get('title') or d.get('name') or 'Material'}\n{(d.get('content') or d.get('description') or text)[:1800]}" for i,(_,d,_,text) in enumerate(docs))
-    from app.services.ai_service import chat, configured
-    history=data.get('history') or []
-    system=("You are Smart Learning Lab AI Study Tutor. Answer the user's exact question, not a guessed question. "
-            "Use the supplied learning context as the primary source. If the context does not contain the answer, say that clearly and then give a short general explanation only if it is safe and useful. "
-            "Do not invent course facts. Structure answers with a direct answer first, then explanation, examples when useful, and a short next step. "
-            "If the user asks for code, provide code. If they ask a definition, define it. If they ask a comparison, compare it. "
-            "Keep the response appropriate for a learner and directly relevant to the user's wording.")
-    prompt=f"LEARNING CONTEXT:\n{context or 'No matching course context was found.'}\n\nUSER QUESTION:\n{question}"
-    answer=chat(system,prompt,history=history,temperature=0.15) if configured() else None
-    if not answer: answer=_fallback_answer(question,docs)
-    sources=[{'lesson_id':str(d.get('_id')),'title':d.get('title') or d.get('name') or 'Material','snippet':(d.get('content') or d.get('description') or text)[:240],'type':collection,'score':score} for score,d,collection,text in docs]
-    return {'answer':answer.strip(),'sources':sources,'grounded':bool(docs),'provider':'llm' if configured() and answer else 'retrieval','query':question}
+    docs=retrieve(question,data.get('course_id'),5)
+    contexts='\n\n'.join(f"{d.get('title')}: {d.get('content') or d.get('description','')}" for d in docs)
+    answer=llm_answer(question,contexts)
+    if not answer:
+        if docs: answer='Based on your course material:\n\n'+'\n\n'.join(f"• {d.get('title')}: {d.get('content') or d.get('description','')}" for d in docs[:3])
+        else: answer='I could not find enough matching material in the course knowledge base. Try asking about a specific lesson or topic.'
+    return {'answer':answer,'sources':[{'lesson_id':str(d['_id']),'title':d.get('title'),'snippet':(d.get('content') or d.get('description',''))[:220]} for d in docs]}
 
 # ---------------- Speaking Practice ----------------
 @router.post('/ai/speaking/evaluate')
@@ -146,42 +129,191 @@ def speaking(data:dict,user=Depends(current_user)):
 # ---------------- Personalized Learning Path ----------------
 @router.get('/personalized/path')
 def personalized_path(user=Depends(current_user)):
-    db=get_db(); user_id=uid(user)
-    attempts=list(db.test_attempts.find({'user_id':user_id,'status':'submitted'}))
-    weak=[]
+    """Build a resilient, data-backed learning plan for the student UI."""
+    db = get_db(); user_id = uid(user)
+
+    attempts = list(db.test_attempts.find({'user_id': user_id, 'status': 'submitted'}).sort('submitted_at', -1))
+    weak = []
+    percentages = []
     for a in attempts:
-        r=a.get('result',{}); pct=float(r.get('percentage',0));
-        if pct<70: weak.append({'quiz_id':a.get('test_id'),'score':pct})
-    enrolled=[e.get('course_id') for e in db.enrollments.find({'user_id':user_id,'status':'active'})]
-    lessons=[]
-    q={'is_published':True}
-    if enrolled: q['course_id']={'$in':enrolled}
-    for l in db.lessons.find(q).sort('order',1).limit(12): lessons.append(clean(l))
-    return {'summary':'Personalized path based on your progress and weaker quiz results.','weak_areas':weak,'next_steps':lessons[:6],'daily_goal_minutes':20}
+        result = a.get('result') or {}
+        try:
+            pct = float(result.get('percentage', 0) or 0)
+        except Exception:
+            pct = 0
+        percentages.append(pct)
+        if pct < 70:
+            quiz_id = str(a.get('test_id') or a.get('quiz_id') or '')
+            quiz = get_doc('quizzes', quiz_id) if quiz_id else None
+            weak.append({
+                'quiz_id': quiz_id,
+                'score': pct,
+                'topic': (quiz or {}).get('title') or (quiz or {}).get('name') or 'Quiz review'
+            })
+
+    enrollments = list(db.enrollments.find({'user_id': user_id, 'status': 'active'}))
+    enrolled_ids = [str(e.get('course_id')) for e in enrollments if e.get('course_id') is not None]
+
+    lessons_query = {'is_published': True}
+    if enrolled_ids:
+        lessons_query['course_id'] = {'$in': enrolled_ids}
+    lessons = list(db.lessons.find(lessons_query).sort('order', 1).limit(30))
+
+    completed = list(db.progress.find({'user_id': user_id, 'completed': True}))
+    completed_ids = {str(x.get('lesson_id')) for x in completed}
+    total_lessons = len(lessons)
+    completed_lessons = len(completed_ids)
+    overall = round(completed_lessons * 100 / total_lessons, 2) if total_lessons else 0
+
+    # Weekly activity and a small, deterministic XP model shared by the UI.
+    today = datetime.now(timezone.utc).date()
+    week_start = today - timedelta(days=today.weekday())
+    weekly_completed = 0
+    today_completed = 0
+    active_dates = set()
+    for p in completed:
+        raw = p.get('completed_at') or p.get('updated_at') or p.get('created_at')
+        if not raw:
+            continue
+        try:
+            d = raw.date() if hasattr(raw, 'date') else datetime.fromisoformat(str(raw).replace('Z', '+00:00')).date()
+            active_dates.add(d)
+            if d >= week_start:
+                weekly_completed += 1
+            if d == today:
+                today_completed += 1
+        except Exception:
+            continue
+
+    streak = 0
+    cursor = today
+    while cursor in active_dates:
+        streak += 1
+        cursor -= timedelta(days=1)
+
+    passed = sum(1 for a in attempts if bool((a.get('result') or {}).get('passed')))
+    avg = round(sum(percentages) / len(percentages), 2) if percentages else 0
+    flashcards_reviewed = db.flashcard_reviews.count_documents({'user_id': user_id}) if 'flashcard_reviews' in db.list_collection_names() else 0
+    game_sessions = list(db.game_sessions.find({'user_id': user_id, 'status': 'completed'}))
+    game_xp = sum(int(x.get('xp_earned', 0) or 0) for x in game_sessions)
+    xp = len(completed) * 10 + len(attempts) * 5 + passed * 50 + game_xp
+
+    next_steps = []
+    for lesson in lessons:
+        lid = str(lesson.get('_id'))
+        if lid in completed_ids:
+            continue
+        item = clean(lesson)
+        item['type'] = 'lesson'
+        item['course_id'] = str(lesson.get('course_id')) if lesson.get('course_id') is not None else None
+        item['progress_percentage'] = 0
+        item['duration_minutes'] = int(lesson.get('duration_minutes', 25) or 25)
+        item['badge'] = 'Weak Area' if weak and len(next_steps) == 0 else ('Recommended' if len(next_steps) == 1 else 'Review')
+        next_steps.append(item)
+        if len(next_steps) >= 6:
+            break
+
+    # If the learner has no enrollment yet, still provide published lessons as
+    # discoverable recommendations rather than leaving the page blank.
+    if not next_steps:
+        for lesson in db.lessons.find({'is_published': True}).sort('order', 1).limit(6):
+            item = clean(lesson)
+            item['type'] = 'lesson'
+            item['course_id'] = str(lesson.get('course_id')) if lesson.get('course_id') is not None else None
+            item['progress_percentage'] = 0
+            item['duration_minutes'] = int(lesson.get('duration_minutes', 25) or 25)
+            item['badge'] = 'Recommended'
+            next_steps.append(item)
+
+    achievements = [
+        {'icon': '⭐', 'title': 'Consistent Learner', 'subtitle': f'{streak} day streak'},
+        {'icon': '🏆', 'title': 'Quiz Master', 'subtitle': f'{passed} quizzes passed'},
+        {'icon': '⚡', 'title': 'Quick Learner', 'subtitle': f'{completed_lessons} lessons completed'},
+        {'icon': '🃏', 'title': 'Flashcard Pro', 'subtitle': f'{flashcards_reviewed} cards reviewed'},
+    ]
+
+    return {
+        'summary': 'Personalized recommendations based on your progress and recent assessment performance.',
+        'weak_areas': weak[:6],
+        'next_steps': next_steps,
+        'daily_goal_minutes': 20,
+        'today_minutes': today_completed * 10,
+        'weekly_goal_lessons': 5,
+        'weekly_completed_lessons': weekly_completed,
+        'overall_progress': overall,
+        'courses_completed': sum(1 for e in enrollments if db.progress.count_documents({'user_id': user_id, 'course_id': str(e.get('course_id')), 'completed': True}) > 0 and db.lessons.count_documents({'course_id': str(e.get('course_id')), 'is_published': True}) <= db.progress.count_documents({'user_id': user_id, 'course_id': str(e.get('course_id')), 'completed': True})),
+        'courses_total': len(enrollments),
+        'quizzes_completed': len(attempts),
+        'quizzes_passed': passed,
+        'flashcards_reviewed': flashcards_reviewed,
+        'accuracy': avg,
+        'study_hours': f'{(len(completed) * 25) // 60}h {(len(completed) * 25) % 60}m',
+        'streak_days': streak,
+        'xp': xp,
+        'achievements': achievements,
+    }
 
 # ---------------- Adaptive Tests ----------------
 @router.post('/adaptive/tests/submit')
 def adaptive_submit(data:dict,user=Depends(current_user)):
-    questions=data.get('questions') or []; answers=data.get('answers') or {}; correct=0; total=len(questions)
-    for q in questions:
-        qid=str(q.get('_id') or q.get('id')); expected=q.get('correct_answer',q.get('answer')); submitted=answers.get(qid)
-        if submitted is not None and str(submitted)==str(expected): correct+=1
+    db=get_db(); user_id=uid(user)
+    answers=data.get('answers') or {}
+    test_id=str(data.get('test_id') or data.get('attempt_id') or '')
+
+    # Prefer the server-side adaptive attempt created by /adaptive/tests.
+    # This prevents the client from changing the answer key and fixes the
+    # previous bug where the frontend only received questions with answers
+    # removed, so the backend had nothing reliable to grade.
+    attempt = db.adaptive_attempts.find_one({'_id': test_id, 'user_id': user_id}) if test_id else None
+    if not attempt:
+        raise HTTPException(400, 'Mock test session expired. Please start a new test.')
+
+    question_ids=[str(x) for x in attempt.get('question_ids',[])]
+    questions=list(db.questions.find({'_id': {'$in': question_ids}}))
+    by={str(q['_id']):q for q in questions}
+    correct=0; total=len(question_ids); details=[]
+    for qid in question_ids:
+        q=by.get(qid)
+        if not q: continue
+        expected=q.get('correct_answer',q.get('answer'))
+        submitted=answers.get(qid)
+        ok=submitted is not None and str(submitted)==str(expected)
+        if ok: correct+=1
+        details.append({'question_id':qid,'correct':ok,'submitted':submitted})
     pct=round(correct*100/total,2) if total else 0
-    return {'correct':correct,'total':total,'percentage':pct,'passed':pct>=60,'next_level':'hard' if pct>=80 else 'medium' if pct>=60 else 'easy'}
+    result={'test_id':test_id,'correct':correct,'total':total,'percentage':pct,'passed':pct>=60,'next_level':'hard' if pct>=80 else 'medium' if pct>=60 else 'easy','details':details}
+    db.adaptive_attempts.update_one({'_id':test_id,'user_id':user_id},{'$set':{'status':'submitted','result':result,'submitted_at':now()}})
+    return result
 
 @router.post('/adaptive/tests')
 def adaptive_test(data:dict,user=Depends(current_user)):
-    db=get_db(); course_id=data.get('course_id'); count=min(30,max(5,int(data.get('count',10) or 10)))
-    attempts=list(db.test_attempts.find({'user_id':uid(user),'status':'submitted'}).sort('submitted_at',-1).limit(5)); avg=sum(float(a.get('result',{}).get('percentage',60)) for a in attempts)/len(attempts) if attempts else 60
+    db=get_db(); user_id=uid(user); course_id=data.get('course_id'); count=min(30,max(5,int(data.get('count',10) or 10)))
+    attempts=list(db.test_attempts.find({'user_id':user_id,'status':'submitted'}).sort('submitted_at',-1).limit(5))
+    avg=sum(float(a.get('result',{}).get('percentage',60)) for a in attempts)/len(attempts) if attempts else 60
     difficulty='hard' if avg>=80 else 'medium' if avg>=60 else 'easy'
     qs=list(db.questions.find({'is_published':True,**({'course_id':course_id} if course_id else {})}))
-    same=[q for q in qs if str(q.get('difficulty','medium')).lower()==difficulty]; pool=same+qs
-    seen=set(); chosen=[]
+    same=[q for q in qs if str(q.get('difficulty','medium')).lower()==difficulty]
+    pool=same+qs; seen=set(); chosen=[]
     for q in pool:
         sid=str(q['_id'])
-        if sid not in seen: seen.add(sid); chosen.append(clean(q));
+        if sid not in seen:
+            seen.add(sid); chosen.append(q)
         if len(chosen)>=count: break
-    return {'adaptive_level':difficulty,'prior_average':round(avg,2),'questions':[{k:v for k,v in q.items() if k not in ('correct_answer','answer')} for q in chosen]}
+    if not chosen:
+        raise HTTPException(404,'No published questions are available for the mock test.')
+
+    test_id=uuid.uuid4().hex
+    db.adaptive_attempts.insert_one({
+        '_id':test_id,'user_id':user_id,'status':'started','adaptive_level':difficulty,
+        'prior_average':round(avg,2),'question_ids':[str(q['_id']) for q in chosen],
+        'created_at':now()
+    })
+    public_questions=[]
+    for q in chosen:
+        item=clean(q)
+        item.pop('correct_answer',None); item.pop('answer',None); item.pop('explanation',None)
+        public_questions.append(item)
+    return {'test_id':test_id,'adaptive_level':difficulty,'prior_average':round(avg,2),'questions':public_questions}
 
 # ---------------- Flashcards + Spaced Repetition ----------------
 @router.get('/flashcards')
@@ -193,6 +325,16 @@ def create_flashcard(data:dict,user=Depends(current_user)):
     if not data.get('front') or not data.get('back'): raise HTTPException(422,'front and back are required')
     d={'_id':uuid.uuid4().hex,'user_id':uid(user),'front':data['front'],'back':data['back'],'course_id':data.get('course_id'),'ease':2.5,'interval_days':1,'repetitions':0,'due_at':now(),'created_at':now()}
     get_db().flashcards.insert_one(d); return clean(d)
+
+@router.delete('/flashcards/{card_id}')
+def delete_flashcard(card_id: str, user=Depends(current_user)):
+    db = get_db()
+    user_id = uid(user)
+    card = db.flashcards.find_one({'_id': card_id, 'user_id': user_id})
+    if not card:
+        raise HTTPException(404, 'Flashcard not found')
+    db.flashcards.delete_one({'_id': card['_id']})
+    return {'message': 'Flashcard deleted', 'id': str(card['_id'])}
 
 @router.post('/flashcards/{card_id}/review')
 def review_flashcard(card_id:str,data:dict,user=Depends(current_user)):

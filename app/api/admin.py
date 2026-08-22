@@ -5,6 +5,7 @@ from app.core.security import admin_user, root_admin_user, hash_password
 from app.db.mongo import get_db
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
+COURSE_CATEGORIES = ['SSC','Banking','UPSC','English Spoken','Railway','Teaching','Defence','State Exams','Computer','General','Other']
 
 def now():
     return datetime.now(timezone.utc)
@@ -85,6 +86,10 @@ def dashboard(user=Depends(admin_user)):
     counts = {"courses": courses, "published_courses": published_courses, "draft_courses": courses-published_courses, "modules": modules, "lessons": lessons, "questions": questions, "quizzes": quizzes, "published_quizzes": published_quizzes, "students": students, "admins": admins, "quiz_attempts": quiz_attempts}
     return {"admin": {"id": str(user["_id"]), "name": user.get("name", "Admin"), "role": user.get("role")}, "counts": counts, **counts}
 
+@router.get("/course-categories")
+def course_categories(user=Depends(admin_user)):
+    return {"categories": COURSE_CATEGORIES}
+
 # Courses
 @router.get("/courses")
 def courses(search: str | None = None, user=Depends(admin_user)):
@@ -108,6 +113,10 @@ def create_course(data: dict, user=Depends(admin_user)):
     d.setdefault("short_description", "")
     d.setdefault("level", "Beginner")
     d.setdefault("category", "General")
+    if d.get("category") not in COURSE_CATEGORIES:
+        raise HTTPException(422, f"Unsupported course category. Choose one of: {', '.join(COURSE_CATEGORIES)}")
+    d.setdefault("subcategory", "")
+    d.setdefault("audience", "")
     d.setdefault("language", "English")
     d.setdefault("learning_objectives", [])
     d.setdefault("prerequisites", [])
@@ -135,6 +144,8 @@ def course(course_id: str, user=Depends(admin_user)):
 
 @router.put("/courses/{course_id}")
 def update_course(course_id: str, data: dict, user=Depends(admin_user)):
+    if data.get("category") is not None and data.get("category") not in COURSE_CATEGORIES:
+        raise HTTPException(422, f"Unsupported course category. Choose one of: {', '.join(COURSE_CATEGORIES)}")
     return update_doc("courses", course_id, data)
 
 @router.delete("/courses/{course_id}")
@@ -149,11 +160,63 @@ def delete_course(course_id: str, user=Depends(admin_user)):
 
 @router.post("/courses/{course_id}/publish")
 def publish_course(course_id: str, user=Depends(admin_user)):
-    return update_doc("courses", course_id, {"is_published": True})
+    """Publish the complete course tree, including modules, lessons and quizzes."""
+    db = get_db()
+    course = find_by_id("courses", course_id)
+    if not course:
+        raise HTTPException(404, "Course not found")
+
+    db.courses.update_one(
+        {"_id": course["_id"]},
+        {"$set": {"is_published": True, "updated_at": now()}}
+    )
+
+    # Bulk-generated content is initially draft. Once the admin publishes
+    # the course, its children must become visible to students too.
+    course_keys = list({str(x) for x in (course_id, course["_id"])})
+    # Publish topics and quizzes with the course. For PDF imports, only publish
+    # lessons whose detailed source content actually exists. TOC-only entries stay
+    # as admin drafts until a complete PDF or real lesson content is supplied.
+    for collection in ("topics", "quizzes"):
+        db[collection].update_many(
+            {"course_id": {"$in": course_keys}},
+            {"$set": {"is_published": True, "updated_at": now()}}
+        )
+    db.lessons.update_many(
+        {
+            "course_id": {"$in": course_keys},
+            "$or": [
+                {"content_source": {"$ne": "toc_only"}},
+                {"content_source": {"exists": False}},
+            ],
+        },
+        {"$set": {"is_published": True, "updated_at": now()}}
+    )
+
+    return clean(db.courses.find_one({"_id": course["_id"]}))
+
 
 @router.post("/courses/{course_id}/unpublish")
 def unpublish_course(course_id: str, user=Depends(admin_user)):
-    return update_doc("courses", course_id, {"is_published": False})
+    """Unpublish the complete course tree."""
+    db = get_db()
+    course = find_by_id("courses", course_id)
+    if not course:
+        raise HTTPException(404, "Course not found")
+
+    db.courses.update_one(
+        {"_id": course["_id"]},
+        {"$set": {"is_published": False, "updated_at": now()}}
+    )
+
+    course_keys = list({str(x) for x in (course_id, course["_id"])})
+    for collection in ("topics", "lessons", "quizzes"):
+        db[collection].update_many(
+            {"course_id": {"$in": course_keys}},
+            {"$set": {"is_published": False, "updated_at": now()}}
+        )
+
+    return clean(db.courses.find_one({"_id": course["_id"]}))
 
 # Modules / topics
 @router.get("/courses/{course_id}/modules")
@@ -173,7 +236,7 @@ def create_module(course_id: str, data: dict, user=Depends(admin_user)):
     d.setdefault("learning_objectives", [])
     d.setdefault("estimated_minutes", 0)
     d.setdefault("order", get_db().topics.count_documents({"course_id": course_id}) + 1)
-    d.setdefault("is_published", True)
+    d.setdefault("is_published", False)
     return create_doc("topics", d, True)
 
 @router.get("/modules/{module_id}")
@@ -185,6 +248,25 @@ def module(module_id: str, user=Depends(admin_user)):
 @router.put("/modules/{module_id}")
 def update_module(module_id: str, data: dict, user=Depends(admin_user)):
     return update_doc("topics", module_id, data)
+
+@router.post("/modules/{module_id}/publish")
+def publish_module(module_id: str, user=Depends(admin_user)):
+    """Publish a topic/module only. Lessons remain independently publishable."""
+    return update_doc("topics", module_id, {"is_published": True})
+
+@router.post("/modules/{module_id}/unpublish")
+def unpublish_module(module_id: str, user=Depends(admin_user)):
+    """Unpublish a topic and its lessons so students cannot access orphaned lessons."""
+    module = find_by_id("topics", module_id)
+    if not module:
+        raise HTTPException(404, "Module not found")
+    result = update_doc("topics", module_id, {"is_published": False})
+    db = get_db()
+    db.lessons.update_many(
+        {"topic_id": module_id},
+        {"$set": {"is_published": False, "updated_at": now()}}
+    )
+    return result
 
 @router.delete("/modules/{module_id}")
 def delete_module(module_id: str, user=Depends(admin_user)):
@@ -215,7 +297,7 @@ def create_lesson(module_id: str, data: dict, user=Depends(admin_user)):
     d.setdefault("order", get_db().lessons.count_documents({"topic_id": module_id}) + 1)
     d.setdefault("duration_minutes", 10)
     d.setdefault("resources", [])
-    d.setdefault("is_published", True)
+    d.setdefault("is_published", False)
     return create_doc("lessons", d, True)
 
 @router.get("/lessons/{lesson_id}")
@@ -227,6 +309,24 @@ def lesson(lesson_id: str, user=Depends(admin_user)):
 @router.put("/lessons/{lesson_id}")
 def update_lesson(lesson_id: str, data: dict, user=Depends(admin_user)):
     return update_doc("lessons", lesson_id, data)
+
+@router.post("/lessons/{lesson_id}/publish")
+def publish_lesson(lesson_id: str, user=Depends(admin_user)):
+    """Publish one lesson. The parent course and topic must already be published for students to see it."""
+    lesson = find_by_id("lessons", lesson_id)
+    if not lesson:
+        raise HTTPException(404, "Lesson not found")
+    topic = find_by_id("topics", str(lesson.get("topic_id")))
+    if topic and topic.get("is_published") is False:
+        raise HTTPException(409, "Publish the parent topic before publishing this lesson")
+    course = find_by_id("courses", str(lesson.get("course_id")))
+    if course and course.get("is_published") is False:
+        raise HTTPException(409, "Publish the parent course before publishing this lesson")
+    return update_doc("lessons", lesson_id, {"is_published": True})
+
+@router.post("/lessons/{lesson_id}/unpublish")
+def unpublish_lesson(lesson_id: str, user=Depends(admin_user)):
+    return update_doc("lessons", lesson_id, {"is_published": False})
 
 @router.delete("/lessons/{lesson_id}")
 def delete_lesson(lesson_id: str, user=Depends(admin_user)):
@@ -310,10 +410,37 @@ def delete_quiz(quiz_id: str, user=Depends(admin_user)):
 
 @router.post("/quizzes/{quiz_id}/publish")
 def publish_quiz(quiz_id: str, user=Depends(admin_user)):
-    return update_doc("quizzes", quiz_id, {"is_published": True})
+    quiz = find_by_id("quizzes", quiz_id)
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+
+    question_ids = list(quiz.get("question_ids", []) or [])
+    if not question_ids:
+        raise HTTPException(400, "Add at least one question before publishing the quiz")
+
+    missing = [str(qid) for qid in question_ids if not find_by_id("questions", str(qid))]
+    if missing:
+        raise HTTPException(400, f"Quiz contains missing question(s): {', '.join(missing)}")
+
+    # Publishing the quiz also publishes its attached questions.  Bulk quiz
+    # import intentionally creates questions as drafts so the admin can review
+    # them first.  Once the quiz is explicitly published, those questions must
+    # become visible to students as part of the published quiz.
+    db = get_db()
+    db.questions.update_many(
+        {"_id": {"$in": question_ids}},
+        {"$set": {"is_published": True, "published_at": now()}},
+    )
+    return update_doc("quizzes", quiz_id, {
+        "is_published": True,
+        "published_at": now(),
+    })
 
 @router.post("/quizzes/{quiz_id}/unpublish")
 def unpublish_quiz(quiz_id: str, user=Depends(admin_user)):
+    quiz = find_by_id("quizzes", quiz_id)
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
     return update_doc("quizzes", quiz_id, {"is_published": False})
 
 @router.post("/quizzes/{quiz_id}/questions")

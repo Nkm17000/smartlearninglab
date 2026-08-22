@@ -179,20 +179,117 @@ def course_reviews(course_id: str, user=Depends(current_user)):
     return [clean(x) for x in get_db().course_reviews.find({"course_id": course_id}).sort("created_at", -1).limit(100)]
 
 @router.post("/courses/{course_id}/reviews")
-def add_course_review(course_id: str, data: dict, user=Depends(current_user)):
-    db = get_db(); user_id = uid(user)
-    if not find("courses", course_id):
-        raise HTTPException(404, "Course not found")
-    rating = int(data.get("rating", 0))
-    if rating < 1 or rating > 5:
-        raise HTTPException(422, "Rating must be between 1 and 5")
-    d = {"_id": uuid.uuid4().hex, "course_id": course_id, "user_id": user_id, "user_name": user.get("name", "Student"), "rating": rating, "review": str(data.get("review", ""))[:2000], "created_at": now()}
-    db.course_reviews.update_one({"course_id": course_id, "user_id": user_id}, {"$set": d}, upsert=True)
-    reviews = list(db.course_reviews.find({"course_id": course_id}))
-    avg = round(sum(int(x.get("rating", 0)) for x in reviews) / len(reviews), 1) if reviews else 0
-    db.courses.update_one({"_id": find("courses", course_id)["_id"]}, {"$set": {"rating": avg, "review_count": len(reviews)}})
-    return clean(d)
+def add_course_review(
+    course_id: str,
+    data: dict,
+    user=Depends(current_user)
+):
+    db = get_db()
+    user_id = uid(user)
 
+    # Validate course
+    course = find("courses", str(course_id))
+
+    if not course:
+        raise HTTPException(
+            status_code=404,
+            detail="Course not found"
+        )
+
+    # Validate rating safely
+    try:
+        rating = int(data.get("rating", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="Rating must be a number between 1 and 5"
+        )
+
+    if rating < 1 or rating > 5:
+        raise HTTPException(
+            status_code=422,
+            detail="Rating must be between 1 and 5"
+        )
+
+    # Validate review text
+    review_text = str(
+        data.get("review", "")
+    ).strip()
+
+    if not review_text:
+        raise HTTPException(
+            status_code=422,
+            detail="Review cannot be empty"
+        )
+
+    if len(review_text) > 2000:
+        raise HTTPException(
+            status_code=422,
+            detail="Review cannot exceed 2000 characters"
+        )
+
+    # Always store course_id as string
+    # so it matches GET /reviews
+    course_id = str(course_id)
+
+    review_doc = {
+        "_id": uuid.uuid4().hex,
+        "course_id": course_id,
+        "user_id": user_id,
+        "user_name": user.get("name", "Student"),
+        "rating": rating,
+        "review": review_text,
+        "created_at": now()
+    }
+
+    # One review per student per course.
+    # Updating the same review is allowed.
+    db.course_reviews.update_one(
+        {
+            "course_id": course_id,
+            "user_id": user_id
+        },
+        {
+            "$set": review_doc
+        },
+        upsert=True
+    )
+
+    # Recalculate rating
+    reviews = list(
+        db.course_reviews.find({
+            "course_id": course_id
+        })
+    )
+
+    average_rating = (
+        round(
+            sum(
+                int(x.get("rating", 0))
+                for x in reviews
+            ) / len(reviews),
+            1
+        )
+        if reviews
+        else 0
+    )
+
+    # Update course rating
+    course_id_value = course.get("_id")
+
+    db.courses.update_one(
+        {
+            "_id": course_id_value
+        },
+        {
+            "$set": {
+                "rating": average_rating,
+                "review_count": len(reviews)
+            }
+        }
+    )
+
+    return clean(review_doc)
 @router.get("/certificates")
 def certificates(user=Depends(current_user)):
     return [clean(x) for x in get_db().certificates.find({"user_id": uid(user)}).sort("issued_at", -1)]
