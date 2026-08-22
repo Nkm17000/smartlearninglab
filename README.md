@@ -1,36 +1,11 @@
-# Smart Learning Lab – Final FE
+# Smart Learning Lab Backend
 
-Expo 54 / React Native / React Native Web frontend.
-
-## Features
-
-- Adda247-inspired education discovery UI
-- Student registration, login, forgot password and OAuth buttons
-- Course discovery/search and exam filters
-- Course curriculum and lesson completion
-- Test series and quiz flow
-- Student progress and analytics
-- XP, streaks, leaderboard and badges
-- Bookmarks, notes, notifications and certificates
-- Course ratings/reviews
-- AI Tutor
-- Admin course builder, question bank and test series
-- Admin analytics
-- Root-admin staff management
-
-## Environment
-
-Create `.env`:
-
-```env
-EXPO_PUBLIC_API_BASE_URL=http://127.0.0.1:8000/api/v1
-```
+FastAPI backend.
 
 ## Run
-
 ```powershell
-npm install
-npx expo start -c
+python -m pip install -r requirements.txt
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Web: `http://localhost:8081`
+Configure MongoDB, SMTP, and other secrets through environment variables. Do not commit `.env`.
