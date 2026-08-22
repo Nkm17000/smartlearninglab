@@ -1,20 +1,36 @@
-# Smart Learning Lab Backend
+# Smart Learning Lab – Final FE
 
-## Run
-```bash
-pip install -r requirements.txt
-copy .env.example .env
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+Expo 54 / React Native / React Native Web frontend.
+
+## Features
+
+- Adda247-inspired education discovery UI
+- Student registration, login, forgot password and OAuth buttons
+- Course discovery/search and exam filters
+- Course curriculum and lesson completion
+- Test series and quiz flow
+- Student progress and analytics
+- XP, streaks, leaderboard and badges
+- Bookmarks, notes, notifications and certificates
+- Course ratings/reviews
+- AI Tutor
+- Admin course builder, question bank and test series
+- Admin analytics
+- Root-admin staff management
+
+## Environment
+
+Create `.env`:
+
+```env
+EXPO_PUBLIC_API_BASE_URL=http://127.0.0.1:8000/api/v1
 ```
 
-## AI configuration
-Set `AI_API_KEY` + `AI_BASE_URL` + `AI_MODEL` in `.env` for generative AI. Groq-compatible configuration is also supported with `GROQ_API_KEY` and `GROQ_MODEL`.
+## Run
 
-Important AI endpoints:
-- POST `/api/v1/ai/tutor/rag`
-- GET `/api/v1/ai/coach`
-- POST `/api/v1/ai/personalized-quiz`
-- POST `/api/v1/ai/study-plan`
-- GET `/api/v1/career/roadmap`
-- POST `/api/v1/ai/mock-interview`
-- GET `/api/v1/search`
+```powershell
+npm install
+npx expo start -c
+```
+
+Web: `http://localhost:8081`

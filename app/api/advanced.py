@@ -83,22 +83,293 @@ def review_attempt(quiz_id:str,attempt_id:str,user=Depends(current_user)):
     if not a: raise HTTPException(404,'Attempt not found')
     return clean(a)
 
-# ---------- Gamification ----------
+# ---------- Gamification: profile + real game engine ----------
+GAME_DEFS = {
+    'daily-challenge': {'title':'Daily Challenge','game_type':'mcq','count':5,'time_limit_seconds':600,'xp_correct':20,'completion_bonus':40},
+    'speed-quiz': {'title':'Speed Quiz','game_type':'mcq','count':8,'time_limit_seconds':60,'xp_correct':15,'completion_bonus':50},
+    'flashcard-battle': {'title':'Flashcard Battle','game_type':'flashcard','count':5,'time_limit_seconds':300,'xp_correct':15,'completion_bonus':45},
+    'match-learn': {'title':'Match & Learn','game_type':'match','count':5,'time_limit_seconds':300,'xp_correct':20,'completion_bonus':50},
+    'word-scramble': {'title':'Word Scramble','game_type':'word_scramble','count':5,'time_limit_seconds':180,'xp_correct':25,'completion_bonus':60},
+    'boss-battle': {'title':'Boss Battle','game_type':'mcq','count':10,'time_limit_seconds':600,'xp_correct':30,'completion_bonus':100},
+}
+
+
+def _game_questions(db, count, difficulty=None):
+    q = {'is_published': True}
+    if difficulty: q['difficulty'] = difficulty
+    rows = list(db.questions.find(q).limit(100))
+    if len(rows) < count:
+        rows = list(db.questions.find({'is_published': True}).limit(200))
+    # Prefer questions with options because the game engine is MCQ-first.
+    rows = [x for x in rows if x.get('question') or x.get('text')]
+    return rows[:count]
+
+
+def _shuffle(values):
+    import random
+    values = list(values)
+    random.shuffle(values)
+    return values
+
+
+def _word_from_question(q):
+    # Prefer an explicit learning term if one exists; otherwise derive a
+    # compact answer from the correct option. The answer itself is never sent
+    # to the client until the server grades the submission.
+    term = q.get('term') or q.get('word') or q.get('keyword')
+    if term: return str(term).strip()
+    options = q.get('options') or []
+    idx = q.get('correct_answer', q.get('answer'))
+    try:
+        if isinstance(idx, int) and 0 <= idx < len(options):
+            opt = options[idx]
+            return str(opt.get('text') if isinstance(opt, dict) else opt).strip()
+    except Exception:
+        pass
+    text = str(q.get('question') or q.get('text') or '').strip()
+    words = re.findall(r'[A-Za-z]{4,}', text)
+    return words[0] if words else 'learning'
+
+
+def _scramble(word):
+    import random
+    clean_word = re.sub(r'[^A-Za-z]', '', word).lower()
+    if len(clean_word) < 4: return clean_word[::-1]
+    chars = list(clean_word)
+    for _ in range(5):
+        random.shuffle(chars)
+        out = ''.join(chars)
+        if out != clean_word: return out
+    return clean_word[::-1]
+
+
 @router.get('/gamification')
 def gamification(user=Depends(current_user)):
-    db=get_db(); user_id=uid(user)
-    lessons=db.progress.count_documents({'user_id':user_id,'completed':True})
-    attempts=list(db.test_attempts.find({'user_id':user_id,'status':'submitted'}))
-    passed=sum(1 for a in attempts if a.get('result',{}).get('passed'))
-    courses=db.enrollments.count_documents({'user_id':user_id,'status':'active'})
-    xp=lessons*10+len(attempts)*5+passed*50
-    if lessons>=1: xp+=10
-    level=1+xp//500
-    badges=[]
-    rules=[(lessons>=1,'first_lesson','First Lesson','📖'),(lessons>=10,'ten_lessons','10 Lessons','🎯'),(len(attempts)>=5,'test_taker','Test Taker','📝'),(xp>=500,'rising_star','Rising Star','⭐')]
-    for ok,code,name,icon in rules:
-        if ok: badges.append({'code':code,'name':name,'icon':icon})
-    return {'xp':xp,'level':level,'courses':courses,'lessons':lessons,'tests':len(attempts),'passed_tests':passed,'badges':badges}
+    db = get_db()
+    user_id = uid(user)
+
+    lessons = db.progress.count_documents({'user_id': user_id, 'completed': True})
+    attempts = list(db.test_attempts.find({'user_id': user_id, 'status': 'submitted'}))
+    passed = sum(1 for a in attempts if (a.get('result', {}) or {}).get('passed'))
+    courses = db.enrollments.count_documents({'user_id': user_id, 'status': 'active'})
+    game_rows = list(db.game_sessions.find({'user_id': user_id, 'status': 'completed'}))
+    game_xp = sum(int(x.get('xp_earned', 0) or 0) for x in game_rows)
+    game_wins = sum(1 for x in game_rows if x.get('passed'))
+    xp = lessons * 10 + len(attempts) * 5 + passed * 50 + game_xp
+    if lessons >= 1:
+        xp += 10
+    level = 1 + xp // 500
+
+    badges = []
+    rules = [
+        (lessons >= 1, 'first_lesson', 'First Lesson', '📖'),
+        (lessons >= 10, 'ten_lessons', '10 Lessons', '🎯'),
+        (len(attempts) >= 5, 'test_taker', 'Test Taker', '📝'),
+        (game_wins >= 1, 'game_winner', 'Game Winner', '🎮'),
+        (len(game_rows) >= 10, 'arcade_regular', 'Arcade Regular', '🕹️'),
+        (xp >= 500, 'rising_star', 'Rising Star', '⭐'),
+    ]
+    for ok, code, name, icon in rules:
+        if ok:
+            badges.append({'code': code, 'name': name, 'icon': icon})
+
+    # Learning streak based on completed lesson dates.
+    completed = list(db.progress.find({'user_id': user_id, 'completed': True}))
+    active_dates = set()
+    for p in completed:
+        dt = p.get('completed_at') or p.get('updated_at') or p.get('created_at')
+        if dt:
+            try: active_dates.add(dt.date().isoformat())
+            except Exception:
+                try: active_dates.add(str(dt)[:10])
+                except Exception: pass
+    streak = 0
+    cursor = datetime.now(timezone.utc).date()
+    while cursor.isoformat() in active_dates:
+        streak += 1
+        cursor -= timedelta(days=1)
+
+    # Compute a small real leaderboard from student activity. It is intentionally
+    # derived from existing collections so no separate leaderboard migration is needed.
+    students = list(db.users.find({'role': 'student'}, {'password_hash': 0}).limit(100))
+    leaderboard = []
+    for st_user in students:
+        sid = str(st_user.get('_id'))
+        lcount = db.progress.count_documents({'user_id': sid, 'completed': True})
+        ats = list(db.test_attempts.find({'user_id': sid, 'status': 'submitted'}))
+        spassed = sum(1 for a in ats if (a.get('result', {}) or {}).get('passed'))
+        games = list(db.game_sessions.find({'user_id': sid, 'status': 'completed'}))
+        sxp = lcount * 10 + len(ats) * 5 + spassed * 50 + sum(int(g.get('xp_earned', 0) or 0) for g in games)
+        if lcount: sxp += 10
+        leaderboard.append({
+            'user_id': sid,
+            'name': st_user.get('name') or st_user.get('full_name') or st_user.get('email', 'Student').split('@')[0],
+            'xp': sxp
+        })
+    leaderboard.sort(key=lambda x: x['xp'], reverse=True)
+    for i, row in enumerate(leaderboard[:5], 1):
+        row['rank'] = i
+
+    achievements = [
+        {'icon': '🟢', 'title': 'Daily Starter', 'subtitle': 'Play a game today'},
+        {'icon': '🟠', 'title': 'Quick Learner', 'subtitle': 'Score 100% in any game'},
+        {'icon': '🔴', 'title': 'Streak Keeper', 'subtitle': f'Maintain {max(3, streak)} day streak'},
+        {'icon': '🔵', 'title': 'First Challenger', 'subtitle': 'Complete your first game'},
+    ]
+
+    return {
+        'xp': xp, 'level': level, 'courses': courses, 'lessons': lessons,
+        'tests': len(attempts), 'passed_tests': passed,
+        'games_played': len(game_rows), 'games_won': game_wins, 'game_xp': game_xp,
+        'streak_days': streak, 'best_streak': max(streak, 0),
+        'high_score': max([int(g.get('score', 0) or 0) for g in game_rows] or [0]),
+        'badges': badges, 'leaderboard': leaderboard, 'achievements': achievements
+    }
+
+
+@router.post('/gamification/games/{slug}/start')
+def start_game(slug:str, data:dict|None=None, user=Depends(current_user)):
+    db=get_db(); user_id=uid(user); definition=GAME_DEFS.get(slug)
+    if not definition: raise HTTPException(404,'Game not found')
+    import random
+    count=definition['count']
+    game_type=definition['game_type']
+    items=[]
+
+    if game_type == 'flashcard':
+        cards=list(db.flashcards.find({'user_id':user_id}).sort('due_at',1).limit(max(count,20)))
+        if not cards:
+            # Fall back to published questions so a new learner can still play.
+            qs=_game_questions(db,count)
+            for q in qs:
+                opts=q.get('options') or []
+                idx=q.get('correct_answer',q.get('answer'))
+                try:
+                    back=opts[int(idx)] if isinstance(idx,(int,str)) and str(idx).isdigit() else q.get('answer','Review this concept')
+                except Exception: back=q.get('answer','Review this concept')
+                if isinstance(back,dict): back=back.get('text') or back.get('label') or back.get('value')
+                cards.append({'_id':uuid.uuid4().hex,'front':q.get('question') or q.get('text'),'back':back or 'Review this concept'})
+        cards=cards[:count]
+        items=[{'id':str(c.get('_id')),'front':str(c.get('front','')),'back':str(c.get('back',''))} for c in cards]
+
+    elif game_type == 'word_scramble':
+        qs=_game_questions(db,count)
+        seen=set()
+        for q in qs:
+            word=_word_from_question(q)
+            key=word.lower()
+            if len(key)<3 or key in seen: continue
+            seen.add(key); items.append({'id':str(q.get('_id')),'scrambled':_scramble(word)})
+            if len(items)>=count: break
+
+    elif game_type == 'match':
+        qs=_game_questions(db,count)
+        for q in qs:
+            opts=q.get('options') or []
+            idx=q.get('correct_answer',q.get('answer'))
+            try: idx=int(idx)
+            except Exception: continue
+            if not isinstance(opts,list) or not (0<=idx<len(opts)): continue
+            correct=opts[idx]
+            if isinstance(correct,dict): correct=correct.get('text') or correct.get('label') or correct.get('value')
+            rights=[]
+            for o in opts:
+                rights.append(o.get('text') if isinstance(o,dict) else str(o))
+            rights=_shuffle(rights)
+            items.append({'id':str(q.get('_id')),'left':q.get('question') or q.get('text'),'right_options':rights})
+            if len(items)>=count: break
+
+    else:
+        qs=_game_questions(db,count)
+        for q in qs:
+            options=q.get('options') or []
+            normalized=[]
+            for o in options:
+                normalized.append(o.get('text') if isinstance(o,dict) else str(o))
+            if not normalized: continue
+            item={'id':str(q.get('_id')),'question':q.get('question') or q.get('text'),'options':normalized}
+            items.append(item)
+            if len(items)>=count: break
+
+    if not items: raise HTTPException(404,'Not enough published learning content to start this game.')
+    session_id=uuid.uuid4().hex
+    d={'_id':session_id,'user_id':user_id,'slug':slug,'title':definition['title'],'game_type':game_type,
+       'status':'started','current_index':0,'score':0,'correct_count':0,'wrong_count':0,'xp_earned':0,
+       'items':items,'total':len(items),'time_limit_seconds':definition['time_limit_seconds'],'started_at':now(),
+       'created_at':now()}
+    # Store private answer metadata separately from public session items.
+    if game_type in ('mcq','match','word_scramble'):
+        d['answer_keys']={}
+        for q in _game_questions(db, count):
+            qid=str(q.get('_id'))
+            if game_type=='word_scramble':
+                word=_word_from_question(q); d['answer_keys'][qid]=word.strip().lower()
+            else:
+                expected=q.get('correct_answer',q.get('answer'))
+                if game_type=='match':
+                    opts=q.get('options') or []
+                    try: expected=str(opts[int(expected)].get('text') if isinstance(opts[int(expected)],dict) else opts[int(expected)])
+                    except Exception: expected=str(expected)
+                d['answer_keys'][qid]=str(expected)
+    db.game_sessions.insert_one(d)
+    public={k:d[k] for k in ('_id','slug','title','game_type','current_index','score','total','time_limit_seconds')}
+    public['session_id']=session_id; public['description']=f"{definition['title']} • {len(items)} rounds"
+    public['items']=items
+    return public
+
+
+@router.post('/gamification/sessions/{session_id}/answer')
+def answer_game(session_id:str,data:dict,user=Depends(current_user)):
+    db=get_db(); user_id=uid(user); s=db.game_sessions.find_one({'_id':session_id,'user_id':user_id})
+    if not s: raise HTTPException(404,'Game session not found')
+    if s.get('status')!='started': return {'finished':True,'status':s.get('status'),'score':s.get('score',0),'xp_earned':s.get('xp_earned',0)}
+    idx=int(s.get('current_index',0)); items=s.get('items',[])
+    if idx>=len(items): return finish_game(session_id,user)
+    item=items[idx]; submitted=data.get('answer'); slug=s.get('slug'); game_type=s.get('game_type')
+    key=s.get('answer_keys',{}).get(str(item.get('id')))
+    correct=False; correct_index=None; explanation=''
+    if game_type=='flashcard':
+        quality=int(submitted or 0); correct=quality>=3; explanation='3 or 5 means the card was recalled well.'
+        xp=15 if correct else 5
+    elif game_type=='word_scramble':
+        correct=str(submitted or '').strip().lower()==str(key or '').strip().lower(); xp=25 if correct else 5
+        explanation=f"Correct word: {key}" if key else ''
+    else:
+        if game_type=='match':
+            opts=item.get('right_options') or []; expected=str(key or '')
+            try: selected=opts[int(submitted)]; correct=str(selected).strip()==expected.strip()
+            except Exception: correct=False
+            correct_index=next((i for i,o in enumerate(opts) if str(o).strip()==expected.strip()),None)
+        else:
+            try: correct=str(submitted)==str(key)
+            except Exception: correct=False
+            try: correct_index=int(key)
+            except Exception: correct_index=None
+        xp=30 if slug=='boss-battle' and correct else 20 if correct else 5
+        qrow=db.questions.find_one({'_id':item.get('id')})
+        explanation=str(qrow.get('explanation','')) if qrow else ''
+    new_index=idx+1; score=int(s.get('score',0))+ (10 if correct else 0); correct_count=int(s.get('correct_count',0))+(1 if correct else 0); wrong_count=int(s.get('wrong_count',0))+(0 if correct else 1); xp_total=int(s.get('xp_earned',0))+xp
+    finished=new_index>=len(items)
+    status='completed' if finished else 'started'
+    db.game_sessions.update_one({'_id':session_id},{'$set':{'current_index':new_index,'score':score,'correct_count':correct_count,'wrong_count':wrong_count,'xp_earned':xp_total,'status':status,'updated_at':now(),**({'completed_at':now(),'passed':correct_count>=max(1,int(len(items)*0.6))} if finished else {})}})
+    passed = correct_count >= max(1, int(len(items) * 0.6))
+    if finished:
+        bonus=50 if slug=='boss-battle' else 30
+        xp_total += bonus
+        db.game_sessions.update_one({'_id':session_id},{'$set':{'xp_earned':xp_total,'passed':passed}})
+    return {'correct':correct,'correct_index':correct_index,'explanation':explanation,'xp_earned':xp,'score':score,'current_index':new_index,'finished':finished,'total':len(items),'total_xp':xp_total,'passed':passed,'correct_count':correct_count,'wrong_count':wrong_count}
+
+
+@router.post('/gamification/sessions/{session_id}/finish')
+def finish_game(session_id:str,user=Depends(current_user)):
+    db=get_db(); user_id=uid(user); s=db.game_sessions.find_one({'_id':session_id,'user_id':user_id})
+    if not s: raise HTTPException(404,'Game session not found')
+    if s.get('status')=='completed': return {'finished':True,'status':'completed','score':s.get('score',0),'xp_earned':s.get('xp_earned',0),'passed':s.get('passed',False),'correct':s.get('correct_count',0),'total':s.get('total',0)}
+    correct=int(s.get('correct_count',0)); total=int(s.get('total',0)); passed=correct>=max(1,int(total*0.6))
+    bonus=50 if s.get('slug')=='boss-battle' else 30
+    xp=int(s.get('xp_earned',0))+bonus
+    db.game_sessions.update_one({'_id':session_id},{'$set':{'status':'completed','passed':passed,'xp_earned':xp,'completed_at':now(),'updated_at':now()}})
+    return {'finished':True,'status':'completed','score':s.get('score',0),'xp_earned':xp,'passed':passed,'correct':correct,'total':total}
 
 @router.post('/device-tokens')
 def register_device(data:dict,user=Depends(current_user)):

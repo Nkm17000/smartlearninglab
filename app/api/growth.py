@@ -1,5 +1,6 @@
 from datetime import datetime, timezone, timedelta
 import uuid
+import secrets
 from io import BytesIO
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -180,18 +181,87 @@ def course_reviews(course_id: str, user=Depends(current_user)):
 
 @router.post("/courses/{course_id}/reviews")
 def add_course_review(course_id: str, data: dict, user=Depends(current_user)):
-    db = get_db(); user_id = uid(user)
-    if not find("courses", course_id):
-        raise HTTPException(404, "Course not found")
-    rating = int(data.get("rating", 0))
+    db = get_db()
+    user_id = uid(user)
+    course_id = str(course_id).strip()
+
+    # The course id can be stored either as a string or a Mongo ObjectId.
+    # Use the existing helper so both forms are supported.
+    course = find("courses", course_id)
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    # Validate rating without allowing ValueError to become a 500 response.
+    try:
+        rating = int(data.get("rating", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="Rating must be a number between 1 and 5"
+        )
+
     if rating < 1 or rating > 5:
-        raise HTTPException(422, "Rating must be between 1 and 5")
-    d = {"_id": uuid.uuid4().hex, "course_id": course_id, "user_id": user_id, "user_name": user.get("name", "Student"), "rating": rating, "review": str(data.get("review", ""))[:2000], "created_at": now()}
-    db.course_reviews.update_one({"course_id": course_id, "user_id": user_id}, {"$set": d}, upsert=True)
-    reviews = list(db.course_reviews.find({"course_id": course_id}))
-    avg = round(sum(int(x.get("rating", 0)) for x in reviews) / len(reviews), 1) if reviews else 0
-    db.courses.update_one({"_id": find("courses", course_id)["_id"]}, {"$set": {"rating": avg, "review_count": len(reviews)}})
-    return clean(d)
+        raise HTTPException(
+            status_code=422,
+            detail="Rating must be between 1 and 5"
+        )
+
+    review_text = str(data.get("review", "")).strip()
+
+    if not review_text:
+        raise HTTPException(
+            status_code=422,
+            detail="Review cannot be empty"
+        )
+
+    if len(review_text) > 2000:
+        raise HTTPException(
+            status_code=422,
+            detail="Review cannot exceed 2000 characters"
+        )
+
+    review_doc = {
+        "_id": uuid.uuid4().hex,
+        "course_id": course_id,
+        "user_id": user_id,
+        "user_name": user.get("name", "Student"),
+        "rating": rating,
+        "review": review_text,
+        "created_at": now(),
+    }
+
+    # One review per student/course. Submitting again updates that review.
+    db.course_reviews.update_one(
+        {"course_id": course_id, "user_id": user_id},
+        {"$set": review_doc},
+        upsert=True,
+    )
+
+    reviews = list(
+        db.course_reviews.find({"course_id": course_id})
+    )
+
+    average_rating = (
+        round(
+            sum(int(x.get("rating", 0)) for x in reviews)
+            / len(reviews),
+            1,
+        )
+        if reviews
+        else 0
+    )
+
+    db.courses.update_one(
+        {"_id": course.get("_id")},
+        {
+            "$set": {
+                "rating": average_rating,
+                "review_count": len(reviews),
+            }
+        },
+    )
+
+    return clean(review_doc)
 
 @router.get("/certificates")
 def certificates(user=Depends(current_user)):
@@ -215,28 +285,146 @@ def issue_certificate(course_id: str, user=Depends(current_user)):
     db.certificates.insert_one(d)
     return clean(d)
 
-@router.get("/certificates/{certificate_id}/pdf")
-def certificate_pdf(certificate_id: str, user=Depends(current_user)):
-    cert = get_db().certificates.find_one({"certificate_id": certificate_id, "user_id": uid(user)})
+@router.post("/certificates/{certificate_id}/access")
+def certificate_access(certificate_id: str, user=Depends(current_user)):
+    """Issue a short-lived token so the PDF can be opened/downloaded by a browser."""
+    db = get_db()
+    cert = db.certificates.find_one({
+        "certificate_id": certificate_id,
+        "user_id": uid(user),
+    })
     if not cert:
         raise HTTPException(404, "Certificate not found")
+
+    token = secrets.token_urlsafe(32)
+    expires = now() + timedelta(minutes=10)
+    db.certificate_download_tokens.insert_one({
+        "_id": uuid.uuid4().hex,
+        "token": token,
+        "certificate_id": certificate_id,
+        "user_id": uid(user),
+        "expires_at": expires,
+    })
+    return {
+        "preview_token": token,
+        "download_token": token,
+        "expires_at": expires.isoformat(),
+    }
+
+
+def _certificate_by_download_token(certificate_id: str, token: str):
+    db = get_db()
+    record = db.certificate_download_tokens.find_one({
+        "token": token,
+        "certificate_id": certificate_id,
+        "expires_at": {"$gt": now()},
+    })
+    if not record:
+        raise HTTPException(401, "Certificate download link expired. Please request a new link.")
+    cert = db.certificates.find_one({
+        "certificate_id": certificate_id,
+        "user_id": record["user_id"],
+    })
+    if not cert:
+        raise HTTPException(404, "Certificate not found")
+    return cert
+
+
+def _certificate_pdf_from_cert(cert, disposition: str):
     try:
         from reportlab.lib.pagesizes import A4, landscape
         from reportlab.pdfgen import canvas
     except ImportError:
         raise HTTPException(503, "Certificate PDF support is not installed")
-    buffer = BytesIO(); page = landscape(A4); c = canvas.Canvas(buffer, pagesize=page)
+
+    buffer = BytesIO()
+    page = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=page)
     width, height = page
-    c.setStrokeColorRGB(0.91, 0.12, 0.39); c.setLineWidth(4); c.rect(28, 28, width-56, height-56)
-    c.setFillColorRGB(0.07, 0.09, 0.15); c.setFont("Helvetica-Bold", 28); c.drawCentredString(width/2, height-110, "SMART LEARNING LAB")
-    c.setFont("Helvetica-Bold", 20); c.setFillColorRGB(0.91, 0.12, 0.39); c.drawCentredString(width/2, height-165, "Certificate of Completion")
-    c.setFillColorRGB(0.2,0.2,0.2); c.setFont("Helvetica", 14); c.drawCentredString(width/2, height-220, "This certificate is proudly presented to")
-    c.setFont("Helvetica-Bold", 25); c.drawCentredString(width/2, height-270, cert.get("student_name", "Student"))
-    c.setFont("Helvetica", 14); c.drawCentredString(width/2, height-320, "for successfully completing")
-    c.setFont("Helvetica-Bold", 20); c.drawCentredString(width/2, height-360, cert.get("course_name", "Course"))
-    c.setFont("Helvetica", 11); c.drawCentredString(width/2, 90, f"Certificate ID: {cert.get('certificate_id')}   |   Issued: {day_key(cert.get('issued_at'))}")
-    c.save(); buffer.seek(0)
-    return StreamingResponse(buffer, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={certificate_id}.pdf"})
+
+    c.setFillColorRGB(0.98, 0.99, 1)
+    c.rect(0, 0, width, height, fill=1, stroke=0)
+    c.setStrokeColorRGB(0.91, 0.12, 0.39)
+    c.setLineWidth(5)
+    c.rect(25, 25, width - 50, height - 50, fill=0, stroke=1)
+    c.setStrokeColorRGB(0.15, 0.20, 0.35)
+    c.setLineWidth(1)
+    c.rect(38, 38, width - 76, height - 76, fill=0, stroke=1)
+
+    c.setFillColorRGB(0.07, 0.09, 0.15)
+    c.setFont("Helvetica-Bold", 27)
+    c.drawCentredString(width / 2, height - 105, "SMART LEARNING LAB")
+    c.setFillColorRGB(0.91, 0.12, 0.39)
+    c.setFont("Helvetica-Bold", 21)
+    c.drawCentredString(width / 2, height - 155, "CERTIFICATE OF COMPLETION")
+    c.setFillColorRGB(0.25, 0.28, 0.34)
+    c.setFont("Helvetica", 13)
+    c.drawCentredString(width / 2, height - 205, "This certificate is proudly presented to")
+    c.setFillColorRGB(0.07, 0.09, 0.15)
+    c.setFont("Helvetica-Bold", 27)
+    c.drawCentredString(width / 2, height - 250, cert.get("student_name", "Student"))
+    c.setFillColorRGB(0.25, 0.28, 0.34)
+    c.setFont("Helvetica", 13)
+    c.drawCentredString(width / 2, height - 292, "for successfully completing")
+    c.setFillColorRGB(0.91, 0.12, 0.39)
+    c.setFont("Helvetica-Bold", 20)
+    c.drawCentredString(width / 2, height - 330, cert.get("course_name", "Course"))
+    c.setFillColorRGB(0.25, 0.28, 0.34)
+    c.setFont("Helvetica", 10)
+    c.drawCentredString(
+        width / 2, 70,
+        f"Certificate ID: {cert.get('certificate_id')}   |   Issued: {day_key(cert.get('issued_at'))}"
+    )
+    c.save()
+    buffer.seek(0)
+    filename = f"{cert.get('certificate_id')}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _certificate_pdf_response(certificate_id: str, user_id: str, disposition: str):
+    cert = get_db().certificates.find_one({
+        "certificate_id": certificate_id,
+        "user_id": user_id
+    })
+    if not cert:
+        raise HTTPException(404, "Certificate not found")
+    return _certificate_pdf_from_cert(cert, disposition)
+
+
+@router.get("/certificates/{certificate_id}/preview")
+def certificate_preview(certificate_id: str, user=Depends(current_user)):
+    cert = get_db().certificates.find_one({"certificate_id": certificate_id, "user_id": uid(user)})
+    if not cert:
+        raise HTTPException(404, "Certificate not found")
+    return _certificate_pdf_from_cert(cert, "inline")
+
+
+@router.get("/certificates/{certificate_id}/pdf")
+def certificate_pdf(certificate_id: str, user=Depends(current_user)):
+    cert = get_db().certificates.find_one({"certificate_id": certificate_id, "user_id": uid(user)})
+    if not cert:
+        raise HTTPException(404, "Certificate not found")
+    return _certificate_pdf_from_cert(cert, "attachment")
+
+
+@router.get("/certificates/public/{certificate_id}/preview")
+def certificate_public_preview(certificate_id: str, token: str):
+    cert = _certificate_by_download_token(certificate_id, token)
+    return _certificate_pdf_from_cert(cert, "inline")
+
+
+@router.get("/certificates/public/{certificate_id}/download")
+def certificate_public_download(certificate_id: str, token: str):
+    cert = _certificate_by_download_token(certificate_id, token)
+    return _certificate_pdf_from_cert(cert, "attachment")
+
 
 @router.get("/badges")
 def badges(user=Depends(current_user)):
