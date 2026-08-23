@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 from fastapi.responses import RedirectResponse
 
 import requests
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, EmailStr, Field
 
 from app.core.config import get_settings
@@ -37,6 +37,83 @@ def mask_email(email: str) -> str:
 
 def now():
     return datetime.now(timezone.utc)
+
+
+def frontend_url_for_request(request: Request) -> str:
+    """Return the frontend that initiated the request.
+
+    This is critical for local testing: a local backend must not generate a
+    reset/verification link to the production frontend, otherwise the token
+    is created in the local MongoDB but the production frontend/backend tries
+    to consume it from a different database.
+    """
+    s = get_settings()
+    origin = (request.headers.get("origin") or "").strip().rstrip("/")
+    configured = (s.frontend_web_url or "").strip().rstrip("/")
+
+    if origin:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+        if parsed.scheme in {"http", "https"} and parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+            logger.info("FRONTEND_ORIGIN_SELECTED | mode=local-loopback | origin=%s", origin)
+            return origin
+        if configured and origin == configured:
+            logger.info("FRONTEND_ORIGIN_SELECTED | mode=configured | origin=%s", origin)
+            return origin
+
+    logger.info("FRONTEND_ORIGIN_SELECTED | mode=configured-fallback | origin=%s | configured=%s", origin or "<none>", configured)
+    return configured
+
+
+def backend_url_for_request(request: Request) -> str:
+    """Return the public backend base URL appropriate for this request.
+
+    Local requests use the actual loopback host/port. Production uses
+    BACKEND_PUBLIC_URL so email links never accidentally point at a local
+    server or an outdated host.
+    """
+    s = get_settings()
+    host = (request.url.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return str(request.base_url).rstrip("/")
+    configured = (s.backend_public_url or "").strip().rstrip("/")
+    if configured:
+        return configured
+    return str(request.base_url).rstrip("/")
+
+
+def provider_callback_uri(request: Request, provider: str) -> str:
+    """Select the exact provider callback URL for local or production.
+
+    Local development uses the actual loopback API URL. Production derives the
+    callback from BACKEND_PUBLIC_URL, preventing a stale GITHUB_REDIRECT_URI or
+    GOOGLE_REDIRECT_URI from causing provider redirect_uri mismatch errors.
+    The resulting URL must still be registered in the provider console.
+    """
+    s = get_settings()
+    host = (request.url.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        base = str(request.base_url).rstrip("/")
+        callback = f"{base}/api/v1/auth/{provider}/callback"
+        logger.info(
+            "OAUTH_PROVIDER_CALLBACK_SELECTED | provider=%s | mode=local | callback=%s",
+            provider,
+            callback,
+        )
+        return callback
+
+    backend = (s.backend_public_url or "").strip().rstrip("/")
+    if backend:
+        callback = f"{backend}/api/v1/auth/{provider}/callback"
+    else:
+        callback = s.google_redirect_uri if provider == "google" else s.github_redirect_uri
+
+    logger.info(
+        "OAUTH_PROVIDER_CALLBACK_SELECTED | provider=%s | mode=production | callback=%s",
+        provider,
+        callback,
+    )
+    return callback
 
 
 class RegisterRequest(BaseModel):
@@ -139,44 +216,73 @@ def send_email(to_email: str, subject: str, body: str):
 
 
 @router.post("/register")
-def register(data: RegisterRequest):
+def register(request: Request, data: RegisterRequest):
     logger.info("AUTH_REGISTER_START | email=%s", mask_email(str(data.email)))
     db = get_db()
     email = data.email.lower()
-    # Reject ANY existing account before creating a verification token or sending email.
-    # This includes accounts that registered earlier but never confirmed their email.
-    # Use a case-insensitive lookup so Student@Example.com and student@example.com
-    # cannot create separate registrations.
+
+    # Case-insensitive lookup prevents duplicate accounts. A verified account is
+    # still rejected, but an unverified/pending registration can register again.
+    # In that case we refresh the registration details, invalidate the previous
+    # verification token, create a new token and send the confirmation email again.
     existing = db.users.find_one({
         "email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}
     })
+
+    was_pending = False
     if existing:
-        logger.warning(
-            "AUTH_REGISTER_DUPLICATE_EMAIL | email=%s | user_id=%s | verified=%s",
+        already_verified = bool(existing.get("email_verified", False))
+        logger.info(
+            "AUTH_REGISTER_EXISTING_EMAIL | email=%s | user_id=%s | verified=%s",
             mask_email(email),
             existing.get("_id"),
-            bool(existing.get("email_verified", False)),
-        )
-        raise HTTPException(
-            status_code=409,
-            detail="Email already exists. Please login or use another email.",
+            already_verified,
         )
 
-    user_id = uuid.uuid4().hex
-    user = {
-        "_id": user_id,
-        "name": data.name.strip(),
-        "email": email,
-        "password_hash": hash_password(data.password),
-        "role": "student",
-        "is_active": False,
-        "email_verified": False,
-        "auth_provider": "password",
-        "created_at": now(),
-        "updated_at": now(),
-    }
-    db.users.insert_one(user)
+        if already_verified:
+            logger.warning(
+                "AUTH_REGISTER_DUPLICATE_EMAIL | email=%s | user_id=%s | verified=true",
+                mask_email(email),
+                existing.get("_id"),
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Email already exists. Please login or use another email.",
+            )
 
+        # Existing account is pending email confirmation. Allow the user to
+        # submit registration again and send a fresh confirmation email.
+        was_pending = True
+        user_id = existing["_id"]
+        db.users.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "name": data.name.strip(),
+                "password_hash": hash_password(data.password),
+                "is_active": False,
+                "email_verified": False,
+                "auth_provider": "password",
+                "updated_at": now(),
+            }}
+        )
+        user = db.users.find_one({"_id": user_id}) or existing
+    else:
+        user_id = uuid.uuid4().hex
+        user = {
+            "_id": user_id,
+            "name": data.name.strip(),
+            "email": email,
+            "password_hash": hash_password(data.password),
+            "role": "student",
+            "is_active": False,
+            "email_verified": False,
+            "auth_provider": "password",
+            "created_at": now(),
+            "updated_at": now(),
+        }
+        db.users.insert_one(user)
+
+    # Only the newest verification token is valid.
     raw = secrets.token_urlsafe(48)
     db.email_verification_tokens.delete_many({"user_id": user_id})
     db.email_verification_tokens.insert_one({
@@ -188,7 +294,7 @@ def register(data: RegisterRequest):
     })
 
     s = get_settings()
-    verify_url = f"{s.backend_public_url.rstrip('/')}/api/v1/auth/verify-email?token={raw}"
+    verify_url = f"{backend_url_for_request(request)}/api/v1/auth/verify-email?token={raw}"
     body = (
         f"Hello {user.get('name', 'Student')},\n\n"
         "Welcome to Smart Learning Lab!\n\n"
@@ -201,22 +307,40 @@ def register(data: RegisterRequest):
     try:
         send_email(email, "Confirm your Smart Learning Lab account", body)
     except Exception as exc:
-        # Do not leave an account that can never be activated when SMTP is broken.
+        # Do not remove an existing pending account if only SMTP temporarily fails.
+        # Remove its newly created token so the previous token cannot be confused
+        # with the latest registration attempt.
         db.email_verification_tokens.delete_many({"user_id": user_id})
-        db.users.delete_one({"_id": user_id})
-        print(f"Registration email failed: {exc}")
+        if not was_pending:
+            db.users.delete_one({"_id": user_id})
+        logger.exception(
+            "AUTH_REGISTER_EMAIL_FAILED | email=%s | pending=%s | error_type=%s | error=%s",
+            mask_email(email),
+            was_pending,
+            type(exc).__name__,
+            str(exc),
+        )
         raise HTTPException(503, "Registration email could not be sent. Please try again later.")
 
-    logger.info("AUTH_REGISTER_SUCCESS | email=%s | verification_required=true", mask_email(email))
+    logger.info(
+        "AUTH_REGISTER_SUCCESS | email=%s | verification_required=true | resent=%s",
+        mask_email(email),
+        was_pending,
+    )
     return {
         "verification_required": True,
-        "message": "Registration request created successfully. Please confirm your email to complete registration.",
+        "resent": was_pending,
+        "message": (
+            "A new confirmation email has been sent. Please confirm your email to complete registration."
+            if was_pending
+            else "Registration request created successfully. Please confirm your email to complete registration."
+        ),
         "email": email,
     }
 
 
 @router.post("/register/resend")
-def resend_registration(data: ForgotPasswordRequest):
+def resend_registration(request: Request, data: ForgotPasswordRequest):
     email = data.email.lower()
     logger.info("AUTH_RESEND_VERIFICATION_START | email=%s", mask_email(email))
     db = get_db()
@@ -228,7 +352,7 @@ def resend_registration(data: ForgotPasswordRequest):
     db.email_verification_tokens.delete_many({"user_id": user["_id"]})
     db.email_verification_tokens.insert_one({"_id": uuid.uuid4().hex, "user_id": user["_id"], "token_hash": token_hash(raw), "expires_at": now() + timedelta(hours=get_settings().email_verification_hours), "created_at": now()})
     s = get_settings()
-    verify_url = f"{s.backend_public_url.rstrip('/')}/api/v1/auth/verify-email?token={raw}"
+    verify_url = f"{backend_url_for_request(request)}/api/v1/auth/verify-email?token={raw}"
     body = (f"Hello {user.get('name', 'Student')},\n\nPlease confirm your Smart Learning Lab registration.\n\n"
             f"Confirm your email: {verify_url}\n\nThis link expires in {s.email_verification_hours} hours.\n")
     try:
@@ -242,22 +366,27 @@ def resend_registration(data: ForgotPasswordRequest):
 
 
 @router.post("/verify-email/request")
-def request_email_verification(data: ForgotPasswordRequest):
-    return resend_registration(data)
+def request_email_verification(request: Request, data: ForgotPasswordRequest):
+    return resend_registration(request, data)
 
 
 @router.get("/verify-email")
-def verify_email_link(token: str):
+def verify_email_link(request: Request, token: str):
     logger.info("AUTH_VERIFY_EMAIL_START")
     db = get_db()
     row = db.email_verification_tokens.find_one({"token_hash": token_hash(token)})
-    s = get_settings()
-    if not row or row.get("expires_at", now()) <= now():
-        return RedirectResponse(f"{s.frontend_web_url.rstrip('/')}/?verified=failed", status_code=303)
+    expires_at = normalize_utc(row.get("expires_at")) if row else None
+    if not row or not expires_at or expires_at <= now():
+        logger.warning(
+            "AUTH_VERIFY_EMAIL_INVALID_OR_EXPIRED | token_present=%s | expires_at=%s",
+            bool(token),
+            expires_at,
+        )
+        return RedirectResponse(f"{frontend_url_for_request(request)}/?verified=failed", status_code=303)
 
     user = db.users.find_one({"_id": row["user_id"]})
     if not user:
-        return RedirectResponse(f"{s.frontend_web_url.rstrip('/')}/?verified=failed", status_code=303)
+        return RedirectResponse(f"{frontend_url_for_request(request)}/?verified=failed", status_code=303)
 
     db.users.update_one(
         {"_id": user["_id"]},
@@ -265,7 +394,7 @@ def verify_email_link(token: str):
     )
     db.email_verification_tokens.delete_many({"user_id": user["_id"]})
     logger.info("AUTH_VERIFY_EMAIL_SUCCESS | user_id=%s", user.get("_id"))
-    return RedirectResponse(f"{s.frontend_web_url.rstrip('/')}/?verified=success", status_code=303)
+    return RedirectResponse(f"{frontend_url_for_request(request)}/?verified=success", status_code=303)
 
 
 @router.post("/login")
@@ -293,7 +422,7 @@ def me(token: str = Query(...)):
 
 
 @router.post("/forgot-password")
-def forgot_password(data: ForgotPasswordRequest):
+def forgot_password(request: Request, data: ForgotPasswordRequest):
     email = data.email.lower()
     logger.info("AUTH_FORGOT_PASSWORD_START | email=%s", mask_email(email))
     db = get_db()
@@ -317,7 +446,7 @@ def forgot_password(data: ForgotPasswordRequest):
         "created_at": now(),
     })
 
-    reset_url = f"{get_settings().frontend_web_url.rstrip('/')}/?reset_token={raw}"
+    reset_url = f"{frontend_url_for_request(request)}/?reset_token={raw}"
     body = (
         f"Hello {user.get('name', 'there')},\n\n"
         "We received a request to reset your Smart Learning Lab password.\n\n"
@@ -345,19 +474,44 @@ def forgot_password(data: ForgotPasswordRequest):
 
 @router.post("/reset-password")
 def reset_password(data: ResetPasswordRequest):
-    logger.info("AUTH_RESET_PASSWORD_START")
+    token = str(data.token or "").strip()
+    logger.info("AUTH_RESET_PASSWORD_START | token_present=%s | token_length=%s", bool(token), len(token))
+    if len(token) < 20:
+        raise HTTPException(400, "Reset link is invalid or incomplete. Please request a new reset email.")
+
     db = get_db()
-    record = db.password_reset_tokens.find_one({"token_hash": token_hash(data.token)})
-    if not record or record.get("expires_at", now()) <= now():
-        raise HTTPException(400, "Reset link is invalid or expired")
+    record = db.password_reset_tokens.find_one({"token_hash": token_hash(token)})
+    if not record:
+        logger.warning("AUTH_RESET_PASSWORD_TOKEN_NOT_FOUND")
+        raise HTTPException(400, "Reset link is invalid or expired. Please request a new reset email.")
+
+    expires_at = normalize_utc(record.get("expires_at"))
+    if not expires_at or expires_at <= now():
+        db.password_reset_tokens.delete_one({"_id": record.get("_id")})
+        logger.warning("AUTH_RESET_PASSWORD_TOKEN_EXPIRED | expires_at=%s | now=%s", expires_at, now())
+        raise HTTPException(400, "Reset link is invalid or expired. Please request a new reset email.")
 
     user = db.users.find_one({"_id": record["user_id"]})
     if not user:
+        logger.warning("AUTH_RESET_PASSWORD_USER_NOT_FOUND | user_id=%s", record.get("user_id"))
         raise HTTPException(400, "User not found")
 
-    db.users.update_one({"_id": user["_id"]}, {"$set": {"password_hash": hash_password(data.password), "auth_provider": "password", "updated_at": now()}})
+    result = db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "password_hash": hash_password(data.password),
+            "auth_provider": "password",
+            "is_active": True,
+            "email_verified": user.get("email_verified", True),
+            "updated_at": now(),
+        }},
+    )
+    if result.modified_count != 1:
+        logger.error("AUTH_RESET_PASSWORD_UPDATE_FAILED | user_id=%s | matched=%s | modified=%s", user.get("_id"), result.matched_count, result.modified_count)
+        raise HTTPException(500, "Password could not be updated. Please try again.")
+
     db.password_reset_tokens.delete_many({"user_id": user["_id"]})
-    logger.info("AUTH_RESET_PASSWORD_SUCCESS | user_id=%s", user.get("_id"))
+    logger.info("AUTH_RESET_PASSWORD_SUCCESS | user_id=%s | email=%s", user.get("_id"), mask_email(user.get("email", "")))
     return {"message": "Password reset successful. You can now sign in."}
 
 
@@ -537,19 +691,21 @@ def upsert_social_user(email: str, name: str, provider: str, provider_id: str):
 
 
 @router.get("/{provider}/start")
-def oauth_start(provider: str, redirect_uri: str):
+def oauth_start(request: Request, provider: str, redirect_uri: str):
     s = get_settings()
     provider = provider.lower()
     logger.info("OAUTH_START | provider=%s | redirect_uri=%s | configured_frontend=%s", provider, redirect_uri, s.frontend_web_url)
     redirect_uri = validate_oauth_redirect(redirect_uri)
     state = oauth_state(provider, redirect_uri)
+    callback_uri = provider_callback_uri(request, provider)
+    get_db().oauth_states.update_one({"_id": state}, {"$set": {"provider_callback_uri": callback_uri}})
 
     if provider == "google":
         if not s.google_client_id:
             raise HTTPException(503, "Google OAuth is not configured")
         params = urlencode({
             "client_id": s.google_client_id,
-            "redirect_uri": s.google_redirect_uri,
+            "redirect_uri": callback_uri,
             "response_type": "code",
             "scope": "openid email profile",
             "state": state,
@@ -564,7 +720,7 @@ def oauth_start(provider: str, redirect_uri: str):
             raise HTTPException(503, "GitHub OAuth is not configured")
         params = urlencode({
             "client_id": s.github_client_id,
-            "redirect_uri": s.github_redirect_uri,
+            "redirect_uri": callback_uri,
             "scope": "read:user user:email",
             "state": state,
         })
@@ -575,7 +731,7 @@ def oauth_start(provider: str, redirect_uri: str):
 
 
 @router.get("/{provider}/callback")
-def oauth_callback(provider: str, code: str, state: str):
+def oauth_callback(request: Request, provider: str, code: str, state: str):
     s = get_settings()
     provider = provider.lower()
     logger.info(
@@ -585,7 +741,8 @@ def oauth_callback(provider: str, code: str, state: str):
         bool(code),
     )
     row = get_oauth_state(provider, state)
-    logger.info("OAUTH_STATE_VALIDATED | provider=%s", provider)
+    callback_uri = row.get("provider_callback_uri") or provider_callback_uri(request, provider)
+    logger.info("OAUTH_STATE_VALIDATED | provider=%s | callback_uri=%s", provider, callback_uri)
 
     if provider == "google":
         if not s.google_client_id or not s.google_client_secret:
@@ -594,7 +751,7 @@ def oauth_callback(provider: str, code: str, state: str):
             "code": code,
             "client_id": s.google_client_id,
             "client_secret": s.google_client_secret,
-            "redirect_uri": s.google_redirect_uri,
+            "redirect_uri": callback_uri,
             "grant_type": "authorization_code",
         }, timeout=20)
         if not token_response.ok:
@@ -629,7 +786,7 @@ def oauth_callback(provider: str, code: str, state: str):
             "client_id": s.github_client_id,
             "client_secret": s.github_client_secret,
             "code": code,
-            "redirect_uri": s.github_redirect_uri,
+            "redirect_uri": callback_uri,
         }, headers={"Accept": "application/json"}, timeout=20)
         if not token_response.ok:
             logger.error(
