@@ -1,0 +1,73 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Node / React / Expo
+node_modules/
+.expo/
+.expo-shared/
+dist/
+build/
+web-build/
+
+# React Native
+.metro-health-check*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# IDE / editors
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Python packaging
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Database / local files
+*.db
+*.sqlite
+*.sqlite3
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Generated files
+*.zip
+
+*.log
