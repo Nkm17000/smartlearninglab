@@ -25,10 +25,10 @@ class Settings(BaseSettings):
 
     google_client_id: str = ""
     google_client_secret: str = ""
-    google_redirect_uri: str = "http://localhost:8000/api/v1/auth/google/callback"
+    google_redirect_uri: str = "http://127.0.0.1:8000/api/v1/auth/google/callback"
     github_client_id: str = ""
     github_client_secret: str = ""
-    github_redirect_uri: str = "http://localhost:8000/api/v1/auth/github/callback"
+    github_redirect_uri: str = "http://127.0.0.1:8000/api/v1/auth/github/callback"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

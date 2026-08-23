@@ -364,13 +364,41 @@ def reset_password(data: ResetPasswordRequest):
 # ---------------- OAuth ----------------
 
 def validate_oauth_redirect(redirect_uri: str) -> str:
+    """Validate the FE destination after OAuth."""
+    from urllib.parse import urlparse
+
     s = get_settings()
-    allowed_web = s.frontend_web_url.rstrip("/")
-    allowed_mobile = s.frontend_mobile_scheme.rstrip("/")
-    if redirect_uri.rstrip("/") == allowed_web:
+    if not redirect_uri:
+        logger.warning("OAUTH_REDIRECT_REJECTED | reason=empty")
+        raise HTTPException(400, "Unsupported OAuth redirect URI")
+
+    candidate = redirect_uri.strip().rstrip("/")
+    allowed_web = (s.frontend_web_url or "").strip().rstrip("/")
+    allowed_mobile = (s.frontend_mobile_scheme or "").strip().rstrip("/")
+
+    if allowed_web and candidate == allowed_web:
+        logger.info("OAUTH_REDIRECT_ACCEPTED | mode=configured | redirect=%s", redirect_uri)
         return redirect_uri
-    if redirect_uri.startswith(allowed_mobile + "/") or redirect_uri.startswith(s.frontend_mobile_scheme):
+
+    requested = urlparse(candidate)
+
+    # Mobile custom scheme. Accept smartlearninglab://oauth, smartlearninglab://...
+    mobile_scheme = urlparse(allowed_mobile + "//").scheme if allowed_mobile else ""
+    if mobile_scheme and requested.scheme.lower() == mobile_scheme.lower():
+        logger.info("OAUTH_REDIRECT_ACCEPTED | mode=mobile | redirect=%s", redirect_uri)
         return redirect_uri
+
+    # Expo Web local development can run on localhost or 127.0.0.1 and its port
+    # may change. Only loopback hosts are accepted here; arbitrary hosts remain rejected.
+    loopback = {"localhost", "127.0.0.1", "::1"}
+    if requested.scheme in {"http", "https"} and requested.hostname in loopback:
+        logger.info("OAUTH_REDIRECT_ACCEPTED | mode=local-loopback | redirect=%s", redirect_uri)
+        return redirect_uri
+
+    logger.warning(
+        "OAUTH_REDIRECT_REJECTED | requested=%s | configured_web=%s | configured_mobile=%s",
+        redirect_uri, allowed_web, allowed_mobile
+    )
     raise HTTPException(400, "Unsupported OAuth redirect URI")
 
 
@@ -385,27 +413,104 @@ def oauth_state(provider: str, redirect_uri: str) -> str:
     return state
 
 
+def normalize_utc(value):
+    """Normalize MongoDB/Python datetime values to timezone-aware UTC.
+
+    Older OAuth-state documents may contain naive UTC datetimes while new
+    documents use timezone-aware UTC. Python does not allow comparing those
+    two datetime types directly, so every value is normalized before expiry
+    validation.
+    """
+    if value is None:
+        return None
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
 def get_oauth_state(provider: str, state: str):
     db = get_db()
+
+    logger.info(
+        "OAUTH_STATE_LOOKUP | provider=%s | state_present=%s",
+        provider,
+        bool(state),
+    )
+
     row = db.oauth_states.find_one({"_id": state, "provider": provider})
-    if not row or row.get("expires_at", now()) <= now():
+
+    if not row:
+        logger.warning(
+            "OAUTH_STATE_NOT_FOUND | provider=%s",
+            provider,
+        )
         raise HTTPException(400, "OAuth state is invalid or expired")
+
+    expires_at_raw = row.get("expires_at")
+    expires_at = normalize_utc(expires_at_raw)
+    current_time = now()
+
+    logger.info(
+        "OAUTH_STATE_TIME_CHECK | provider=%s | expires_at=%s | now=%s",
+        provider,
+        expires_at,
+        current_time,
+    )
+
+    if expires_at is None or expires_at <= current_time:
+        logger.warning(
+            "OAUTH_STATE_EXPIRED | provider=%s | expires_at=%s | now=%s",
+            provider,
+            expires_at,
+            current_time,
+        )
+        db.oauth_states.delete_one({"_id": state})
+        raise HTTPException(400, "OAuth state is invalid or expired")
+
     db.oauth_states.delete_one({"_id": state})
+
+    logger.info(
+        "OAUTH_STATE_VALID | provider=%s",
+        provider,
+    )
+
     return row
 
 
 def upsert_social_user(email: str, name: str, provider: str, provider_id: str):
+    """Create or link a verified student account for a trusted OAuth identity.
+
+    OAuth providers have already verified the email identity. If an existing
+    password account uses the same email, link the provider instead of creating
+    a second account, and activate the account so OAuth login works.
+    """
     db = get_db()
-    email = email.lower()
+    email = email.strip().lower()
+
     user = db.users.find_one({"email": email})
     if user:
-        db.users.update_one({"_id": user["_id"]}, {"$set": {
-            "name": name or user.get("name", ""),
-            "oauth_provider": provider,
-            "oauth_provider_id": str(provider_id),
-            "updated_at": now(),
-        }})
-        return db.users.find_one({"_id": user["_id"]})
+        db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {
+                "name": name or user.get("name", ""),
+                "oauth_provider": provider,
+                "oauth_provider_id": str(provider_id),
+                "auth_provider": provider,
+                "email_verified": True,
+                "is_active": True,
+                "updated_at": now(),
+            }},
+        )
+        linked = db.users.find_one({"_id": user["_id"]})
+        logger.info(
+            "OAUTH_USER_LINKED | provider=%s | user_id=%s | email=%s",
+            provider,
+            linked.get("_id"),
+            mask_email(email),
+        )
+        return linked
 
     user = {
         "_id": uuid.uuid4().hex,
@@ -414,6 +519,7 @@ def upsert_social_user(email: str, name: str, provider: str, provider_id: str):
         "password_hash": "",
         "role": "student",
         "is_active": True,
+        "email_verified": True,
         "auth_provider": provider,
         "oauth_provider": provider,
         "oauth_provider_id": str(provider_id),
@@ -421,6 +527,12 @@ def upsert_social_user(email: str, name: str, provider: str, provider_id: str):
         "updated_at": now(),
     }
     db.users.insert_one(user)
+    logger.info(
+        "OAUTH_USER_CREATED | provider=%s | user_id=%s | email=%s",
+        provider,
+        user.get("_id"),
+        mask_email(email),
+    )
     return user
 
 
@@ -428,6 +540,7 @@ def upsert_social_user(email: str, name: str, provider: str, provider_id: str):
 def oauth_start(provider: str, redirect_uri: str):
     s = get_settings()
     provider = provider.lower()
+    logger.info("OAUTH_START | provider=%s | redirect_uri=%s | configured_frontend=%s", provider, redirect_uri, s.frontend_web_url)
     redirect_uri = validate_oauth_redirect(redirect_uri)
     state = oauth_state(provider, redirect_uri)
 
@@ -465,7 +578,14 @@ def oauth_start(provider: str, redirect_uri: str):
 def oauth_callback(provider: str, code: str, state: str):
     s = get_settings()
     provider = provider.lower()
+    logger.info(
+        "OAUTH_CALLBACK_START | provider=%s | state_present=%s | code_present=%s",
+        provider,
+        bool(state),
+        bool(code),
+    )
     row = get_oauth_state(provider, state)
+    logger.info("OAUTH_STATE_VALIDATED | provider=%s", provider)
 
     if provider == "google":
         if not s.google_client_id or not s.google_client_secret:
@@ -478,12 +598,25 @@ def oauth_callback(provider: str, code: str, state: str):
             "grant_type": "authorization_code",
         }, timeout=20)
         if not token_response.ok:
+            logger.error(
+                "OAUTH_TOKEN_EXCHANGE_FAILED | provider=google | status=%s",
+                token_response.status_code,
+            )
             raise HTTPException(400, "Google authorization failed")
+        logger.info("OAUTH_TOKEN_EXCHANGE_SUCCESS | provider=google")
         access = token_response.json().get("access_token")
         profile = requests.get("https://openidconnect.googleapis.com/v1/userinfo", headers={"Authorization": f"Bearer {access}"}, timeout=20)
         if not profile.ok:
+            logger.error(
+                "OAUTH_PROFILE_FAILED | provider=google | status=%s",
+                profile.status_code,
+            )
             raise HTTPException(400, "Could not read Google profile")
         p = profile.json()
+        logger.info(
+            "OAUTH_PROFILE_RECEIVED | provider=google | email=%s",
+            mask_email(p.get("email", "")),
+        )
         email = p.get("email")
         if not email:
             raise HTTPException(400, "Google account has no email")
@@ -499,13 +632,26 @@ def oauth_callback(provider: str, code: str, state: str):
             "redirect_uri": s.github_redirect_uri,
         }, headers={"Accept": "application/json"}, timeout=20)
         if not token_response.ok:
+            logger.error(
+                "OAUTH_TOKEN_EXCHANGE_FAILED | provider=github | status=%s",
+                token_response.status_code,
+            )
             raise HTTPException(400, "GitHub authorization failed")
+        logger.info("OAUTH_TOKEN_EXCHANGE_SUCCESS | provider=github")
         access = token_response.json().get("access_token")
         headers = {"Authorization": f"Bearer {access}", "Accept": "application/vnd.github+json"}
         profile = requests.get("https://api.github.com/user", headers=headers, timeout=20)
         if not profile.ok:
+            logger.error(
+                "OAUTH_PROFILE_FAILED | provider=github | status=%s",
+                profile.status_code,
+            )
             raise HTTPException(400, "Could not read GitHub profile")
         p = profile.json()
+        logger.info(
+            "OAUTH_PROFILE_RECEIVED | provider=github | email=%s",
+            mask_email(p.get("email", "")),
+        )
         email = p.get("email")
         if not email:
             emails = requests.get("https://api.github.com/user/emails", headers=headers, timeout=20)
@@ -525,5 +671,13 @@ def oauth_callback(provider: str, code: str, state: str):
     token = create_access_token(user)
     redirect_uri = row["redirect_uri"]
     sep = "&" if "?" in redirect_uri else "?"
+    logger.info(
+        "OAUTH_CALLBACK_SUCCESS | provider=%s | user_id=%s | redirect_uri=%s",
+        provider,
+        user.get("_id"),
+        redirect_uri,
+    )
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(f"{redirect_uri}{sep}{urlencode({'oauth_token': token})}")
+    return RedirectResponse(
+        f"{redirect_uri}{sep}{urlencode({'oauth_token': token})}"
+    )
