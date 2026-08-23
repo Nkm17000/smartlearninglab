@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.security import current_user
 from app.db.mongo import get_db
 from app.core.cache import (cache, TTL_DASHBOARD, TTL_COURSES, TTL_CATEGORIES,
-                            TTL_FEATURED, TTL_COURSE_OVERVIEW, TTL_QUIZZES, TTL_RESULTS, TTL_PROGRESS, TTL_NOTES, TTL_ENROLLMENTS, invalidate_user)
+                            TTL_FEATURED, TTL_COURSE_OVERVIEW, TTL_QUIZZES, TTL_RESULTS, TTL_PROGRESS, TTL_NOTES, TTL_ENROLLMENTS, TTL_LESSON_VIEW, TTL_LEARNING_SUMMARY, invalidate_user)
 
 router = APIRouter(prefix="/api/v1", tags=["Student Learning"])
 
@@ -300,9 +300,84 @@ def catalog_featured(limit:int=Query(8,ge=1,le=30),user=Depends(current_user)):
     cache.set(key, result, TTL_FEATURED)
     return result
 
+@router.get("/lessons/{lesson_id}")
+def student_lesson(lesson_id: str, user=Depends(current_user)):
+    """Student lesson payload. One request replaces lesson + resources + course progress + notes + navigation calls."""
+    user_id = uid(user)
+    key = f"lesson_view:{user_id}:{lesson_id}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    lesson = published("lessons", lesson_id)
+    db = get_db()
+    course_id = str(lesson.get("course_id"))
+    topic_id = str(lesson.get("topic_id"))
+
+    resources = [clean(x) for x in db.lesson_resources.find(
+        {"lesson_id": lesson_id},
+        {"_id": 1, "title": 1, "url": 1, "type": 1, "duration_seconds": 1, "order": 1}
+    ).sort("order", 1)]
+
+    topic_rows = list(db.topics.find(
+        {"course_id": course_id, "is_published": True}, {"_id": 1, "order": 1}
+    ).sort("order", 1))
+    topic_ids = [str(x.get("_id")) for x in topic_rows]
+    topic_order = {str(x.get("_id")): i for i, x in enumerate(topic_rows)}
+    nav_lessons = list(db.lessons.find(
+        {"course_id": course_id, "topic_id": {"$in": topic_ids}, "is_published": True},
+        {"_id": 1, "topic_id": 1, "title": 1, "name": 1, "order": 1}
+    ).sort([("topic_id", 1), ("order", 1)])) if topic_ids else []
+
+    course_lesson_ids = [str(x.get("_id")) for x in nav_lessons]
+    completed = set()
+    if course_lesson_ids:
+        completed = {
+            str(x.get("lesson_id"))
+            for x in db.progress.find(
+                {"user_id": user_id, "course_id": course_id, "completed": True},
+                {"lesson_id": 1}
+            )
+        }
+
+    total = len(course_lesson_ids)
+    done = len(completed)
+    progress = {
+        "course_id": course_id,
+        "total_lessons": total,
+        "completed_lessons": done,
+        "percentage": round(done * 100 / total, 2) if total else 0,
+    }
+
+    notes = [clean(x) for x in db.notes.find(
+        {"user_id": user_id, "lesson_id": lesson_id},
+        {"_id": 1, "title": 1, "content": 1, "note": 1, "lesson_id": 1, "course_id": 1, "created_at": 1, "updated_at": 1}
+    ).sort("updated_at", -1).limit(1)]
+
+    nav = []
+    for x in nav_lessons:
+        nav.append({
+            "id": str(x.get("_id")),
+            "topic_id": str(x.get("topic_id")),
+            "title": x.get("title") or x.get("name") or "Lesson",
+            "order": x.get("order", 0),
+            "topic_order": topic_order.get(str(x.get("topic_id")), 0),
+            "completed": str(x.get("_id")) in completed,
+        })
+
+    out = clean(lesson)
+    out["resources"] = resources
+    out["progress"] = progress
+    out["note"] = notes[0] if notes else None
+    out["navigation"] = nav
+    out["course_id"] = course_id
+    out["topic_id"] = topic_id
+    cache.set(key, out, TTL_LESSON_VIEW)
+    return out
+
 @router.get("/courses/{course_id}/overview")
 def course_overview(course_id:str,user=Depends(current_user)):
-    key = f"course:overview:{course_id}"
+    key = f"course:overview:{uid(user)}:{course_id}"
     cached = cache.get(key)
     if cached is not None:
         return cached
@@ -322,7 +397,29 @@ def course_overview(course_id:str,user=Depends(current_user)):
         lesson["resources"]=resources_by_lesson.get(str(lesson.get("_id")),[])
     course_out=clean(c)
     course_out["resources"]=clean(list(db.course_resources.find({"course_id":course_id}).sort("order",1)))
-    result={"course":course_out,"modules":modules,"lessons":lessons,"quizzes":quizzes}
+    user_id = uid(user)
+    completed_ids = {
+        str(x.get("lesson_id")) for x in db.progress.find(
+            {"user_id": user_id, "course_id": course_id, "completed": True}, {"lesson_id": 1}
+        )
+    }
+    total_lessons = len(lessons)
+    completed_lessons = sum(1 for x in lessons if str(x.get("_id")) in completed_ids)
+    reviews = [clean(x) for x in db.course_reviews.find({"course_id": course_id}).sort("created_at", -1).limit(20)]
+    bookmarked = bool(db.bookmarks.find_one({"user_id": user_id, "item_type": "course", "item_id": course_id}, {"_id": 1}))
+    course_out["resources"] = course_out.get("resources", [])
+    course_out["progress_percentage"] = round(completed_lessons * 100 / total_lessons, 2) if total_lessons else 0
+    result={
+        "course":course_out,
+        "modules":modules,
+        "lessons":lessons,
+        "quizzes":quizzes,
+        "resources":course_out["resources"],
+        "completed_lesson_ids":sorted(completed_ids),
+        "progress":{"course_id":course_id,"total_lessons":total_lessons,"completed_lessons":completed_lessons,"percentage":course_out["progress_percentage"]},
+        "bookmarked":bookmarked,
+        "reviews":reviews,
+    }
     cache.set(key,result,TTL_COURSE_OVERVIEW)
     return result
 
@@ -346,11 +443,18 @@ def progress(user=Depends(current_user)):
 
 @router.get("/courses/{course_id}/progress")
 def course_progress(course_id: str, user=Depends(current_user)):
-    published("courses",course_id); db=get_db(); user_id=uid(user)
+    user_id=uid(user)
+    key=f"course_progress:{user_id}:{course_id}"
+    cached=cache.get(key)
+    if cached is not None: return cached
+    published("courses",course_id); db=get_db()
     topic_ids=[str(x.get("_id")) for x in db.topics.find({"course_id":course_id,"is_published":True},{"_id":1})]
-    total=db.lessons.count_documents({"course_id":course_id,"topic_id":{"$in":topic_ids},"is_published":True})
-    done=db.progress.count_documents({"user_id":user_id,"course_id":course_id,"completed":True,"lesson_id":{"$in":[str(x.get("_id")) for x in db.lessons.find({"course_id":course_id,"topic_id":{"$in":topic_ids},"is_published":True},{"_id":1})]}})
-    return {"course_id":course_id,"total_lessons":total,"completed_lessons":done,"percentage":round(done*100/total,2) if total else 0}
+    lesson_ids=[str(x.get("_id")) for x in db.lessons.find({"course_id":course_id,"topic_id":{"$in":topic_ids},"is_published":True},{"_id":1})] if topic_ids else []
+    total=len(lesson_ids)
+    done=db.progress.count_documents({"user_id":user_id,"course_id":course_id,"completed":True,"lesson_id":{"$in":lesson_ids}}) if lesson_ids else 0
+    result={"course_id":course_id,"total_lessons":total,"completed_lessons":done,"percentage":round(done*100/total,2) if total else 0}
+    cache.set(key,result,TTL_PROGRESS)
+    return result
 
 @router.post("/progress")
 def save_progress(data: dict, user=Depends(current_user)):
@@ -364,6 +468,10 @@ def save_progress(data: dict, user=Depends(current_user)):
     cache.delete_prefix(f"courses:{uid(user)}:")
     cache.delete_prefix(f"personalized:{uid(user)}")
     cache.delete_prefix(f"progress:{uid(user)}")
+    cache.delete_prefix(f"course_progress:{uid(user)}:")
+    cache.delete_prefix(f"course:overview:{uid(user)}:")
+    cache.delete_prefix(f"lesson_view:{uid(user)}:")
+    cache.delete_prefix(f"learning_summary:{uid(user)}")
     cache.delete_prefix(f"results:{uid(user)}")
     return clean(db.progress.find_one({"user_id":uid(user),"lesson_id":lesson_id}))
 
@@ -378,11 +486,32 @@ def complete_lesson(lesson_id: str, user=Depends(current_user)):
     cache.delete_prefix(f"courses:{uid(user)}:")
     cache.delete_prefix(f"personalized:{uid(user)}")
     cache.delete_prefix(f"progress:{uid(user)}")
+    cache.delete_prefix(f"course_progress:{uid(user)}:")
+    cache.delete_prefix(f"course:overview:{uid(user)}:")
+    cache.delete_prefix(f"lesson_view:{uid(user)}:")
+    cache.delete_prefix(f"learning_summary:{uid(user)}")
     cache.delete_prefix(f"analytics:{uid(user)}")
     cache.delete_prefix(f"badges:{uid(user)}")
     return clean(d)
 
 # Quiz discovery and attempt
+@router.get("/learning/summary")
+def learning_summary(user=Depends(current_user)):
+    """Single payload for My Learning: courses, progress, results and learning path."""
+    user_id=uid(user)
+    key=f"learning_summary:{user_id}"
+    cached=cache.get(key)
+    if cached is not None: return cached
+    db=get_db()
+    courses_data=courses(user=user)
+    progress_data=[clean(x) for x in db.progress.find({"user_id":user_id}).sort("updated_at",-1)]
+    results_data=[clean(x) for x in db.test_attempts.find({"user_id":user_id,"status":"submitted"}).sort("submitted_at",-1).limit(100)]
+    from app.api.features import personalized_path
+    path_data=personalized_path(user)
+    result={"courses":courses_data,"progress":progress_data,"results":results_data,"path":path_data}
+    cache.set(key,result,TTL_LEARNING_SUMMARY)
+    return result
+
 @router.get("/quizzes")
 def quizzes(course_id: str|None=None, module_id: str|None=None, user=Depends(current_user)):
     db=get_db()
@@ -409,6 +538,9 @@ def quiz(quiz_id: str, user=Depends(current_user)):
 
 @router.get("/quizzes/{quiz_id}/questions")
 def quiz_questions(quiz_id: str, user=Depends(current_user)):
+    key=f"quiz_questions:{quiz_id}"
+    cached=cache.get(key)
+    if cached is not None: return cached
     qz=published("quizzes",quiz_id)
     ids=[str(x) for x in qz.get("question_ids",[])]
     # The quiz itself is the publication boundary.  Bulk-imported questions
@@ -419,7 +551,25 @@ def quiz_questions(quiz_id: str, user=Depends(current_user)):
         return []
     found = list(get_db().questions.find({"_id": {"$in": ids}}))
     by = {str(x["_id"]): x for x in found}
-    return [clean(by[i], hide_answers=True) for i in ids if i in by]
+    result=[clean(by[i], hide_answers=True) for i in ids if i in by]
+    cache.set(key,result,5*60)
+    return result
+
+@router.get("/quizzes/{quiz_id}/bundle")
+def quiz_bundle(quiz_id: str, user=Depends(current_user)):
+    """Single request for quiz metadata, questions and attempt state."""
+    qz=published("quizzes",quiz_id); db=get_db(); user_id=uid(user)
+    key=f"quiz_bundle:{user_id}:{quiz_id}"
+    cached=cache.get(key)
+    if cached is not None: return cached
+    ids=[str(x) for x in qz.get("question_ids",[]) or []]
+    found=list(db.questions.find({"_id":{"$in":ids}})) if ids else []
+    by={str(x.get("_id")):x for x in found}
+    questions=[clean(by[i],hide_answers=True) for i in ids if i in by]
+    attempts=db.test_attempts.count_documents({"user_id":user_id,"test_id":quiz_id})
+    result={"quiz":clean(qz),"questions":questions,"attempts_used":attempts,"max_attempts":int(qz.get("max_attempts",3) or 3),"can_start":attempts<int(qz.get("max_attempts",3) or 3)}
+    cache.set(key,result,60)
+    return result
 
 @router.post("/quizzes/{quiz_id}/start")
 def start_quiz(quiz_id: str, user=Depends(current_user)):
@@ -428,6 +578,8 @@ def start_quiz(quiz_id: str, user=Depends(current_user)):
     if attempts>=int(qz.get("max_attempts",3)): raise HTTPException(400,"Maximum attempts reached")
     a={"_id":uuid.uuid4().hex,"user_id":user_id,"test_id":quiz_id,"status":"started","started_at":datetime.now(timezone.utc)}
     db.test_attempts.insert_one(a)
+    cache.delete_prefix(f"quiz_bundle:{user_id}:{quiz_id}")
+    cache.delete_prefix(f"results:{user_id}")
     return {"attempt_id":a["_id"],"quiz_id":quiz_id,"duration_minutes":qz.get("duration_minutes",15)}
 
 @router.post("/quizzes/{quiz_id}/submit")
@@ -477,36 +629,45 @@ def submit_quiz(quiz_id: str, data: dict, user=Depends(current_user)):
     attempt_id=data.get("attempt_id")
     query={"_id":attempt_id,"user_id":user_id} if attempt_id else {"user_id":user_id,"test_id":quiz_id,"status":"started"}
     db.test_attempts.update_one(query,{"$set":{"user_id":user_id,"test_id":quiz_id,"status":"submitted","result":result,"submitted_at":datetime.now(timezone.utc)}},upsert=False)
+    cache.delete_prefix(f"quiz_bundle:{user_id}:{quiz_id}")
+    cache.delete_prefix(f"results:{user_id}")
+    cache.delete_prefix(f"dashboard:{user_id}")
+    cache.delete_prefix(f"home:{user_id}")
+    cache.delete_prefix(f"learning_summary:{user_id}")
+    cache.delete_prefix(f"analytics:{user_id}")
+    cache.delete_prefix(f"analytics_summary:{user_id}")
+    cache.delete_prefix(f"personalized:{user_id}")
     return result
 
-def _enrich_quiz_result(row, db):
-    item=clean(row)
-    quiz_id=str(item.get("test_id") or item.get("quiz_id") or "")
-    qz=db.quizzes.find_one({"_id":quiz_id})
-    if not qz:
-        try:
-            from bson import ObjectId
-            if ObjectId.is_valid(quiz_id):
-                qz=db.quizzes.find_one({"_id":ObjectId(quiz_id)})
-        except Exception:
-            pass
-    if qz:
-        item["quiz_title"]=qz.get("title") or qz.get("name") or "Quiz"
-        item["course_id"]=qz.get("course_id")
-        item["category"]=qz.get("category")
-    result=item.get("result") or {}
-    if isinstance(result,dict):
-        item.setdefault("percentage",result.get("percentage",0))
-        item.setdefault("correct_count",result.get("correct_count",0))
-        item.setdefault("wrong_count",result.get("wrong_count",0))
-        item.setdefault("passed",result.get("passed",False))
-        item.setdefault("details",result.get("details",[]))
-    return item
+def _enrich_quiz_results(rows, db):
+    rows=list(rows)
+    quiz_ids={str(x.get("test_id") or x.get("quiz_id") or "") for x in rows}
+    quiz_ids.discard("")
+    quizzes={str(q.get("_id")):q for q in db.quizzes.find({"_id":{"$in":list(quiz_ids)}},{"title":1,"name":1,"course_id":1,"category":1})} if quiz_ids else {}
+    out=[]
+    for row in rows:
+        item=clean(row)
+        quiz_id=str(item.get("test_id") or item.get("quiz_id") or "")
+        qz=quizzes.get(quiz_id)
+        if qz:
+            item["quiz_title"]=qz.get("title") or qz.get("name") or "Quiz"
+            item["course_id"]=qz.get("course_id")
+            item["category"]=qz.get("category")
+        result=item.get("result") or {}
+        if isinstance(result,dict):
+            item.setdefault("percentage",result.get("percentage",0))
+            item.setdefault("correct_count",result.get("correct_count",0))
+            item.setdefault("wrong_count",result.get("wrong_count",0))
+            item.setdefault("passed",result.get("passed",False))
+            item.setdefault("details",result.get("details",[]))
+        out.append(item)
+    return out
 
 @router.get("/quizzes/{quiz_id}/results")
 def quiz_results(quiz_id: str,user=Depends(current_user)):
     db=get_db()
-    return [_enrich_quiz_result(x,db) for x in db.test_attempts.find({"user_id":uid(user),"test_id":quiz_id,"status":"submitted"}).sort("submitted_at",-1)]
+    rows=list(db.test_attempts.find({"user_id":uid(user),"test_id":quiz_id,"status":"submitted"}).sort("submitted_at",-1))
+    return _enrich_quiz_results(rows,db)
 
 @router.get("/results")
 def results(user=Depends(current_user)):
@@ -514,7 +675,8 @@ def results(user=Depends(current_user)):
     cached = cache.get(key)
     if cached is not None: return cached
     db=get_db()
-    result = [_enrich_quiz_result(x,db) for x in db.test_attempts.find({"user_id":user_id,"status":"submitted"}).sort("submitted_at",-1)]
+    rows=list(db.test_attempts.find({"user_id":user_id,"status":"submitted"}).sort("submitted_at",-1))
+    result = _enrich_quiz_results(rows,db)
     cache.set(key, result, TTL_RESULTS)
     return result
 

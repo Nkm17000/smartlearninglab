@@ -126,43 +126,234 @@ def student_analytics(user=Depends(current_user)):
     cache.set(key, result, TTL_ANALYTICS)
     return result
 
-@router.get("/leaderboard")
-def leaderboard(limit: int = 20, user=Depends(current_user)):
-    db = get_db()
+@router.get("/analytics/summary")
+def analytics_summary(user=Depends(current_user)):
+    """Single, defensive analytics payload for the student analytics page.
+
+    IDs are normalized with $toString so legacy documents containing either
+    ObjectId or string references continue to work.
+    """
     user_id = uid(user)
-    safe_limit = max(1, min(limit, 100))
-    key = f"leaderboard:{safe_limit}"
+    key = f"analytics_summary:{user_id}"
     cached = cache.get(key)
     if cached is not None:
-        result = dict(cached)
-        result["me"] = next((x for x in result["items"] if x["id"] == user_id), None)
-        return result
+        return cached
 
-    # One query for students + one aggregation per activity collection.
-    # Avoids the previous per-student count/find N+1 pattern.
-    students = list(db.users.find(
-        {"role": "student", "is_active": True},
-        {"password_hash": 0, "name": 1}
-    ).limit(500))
+    db = get_db()
 
-    student_ids = [str(s["_id"]) for s in students]
-    if not student_ids:
-        result = {"items": [], "me": None}
-        cache.set(key, {"items": []}, TTL_LEADERBOARD)
-        return result
+    progress = list(db.progress.find(
+        {"user_id": user_id, "completed": True},
+        {"course_id": 1, "lesson_id": 1, "completed_at": 1, "updated_at": 1, "created_at": 1}
+    ))
+    # Legacy data may store user_id as ObjectId. Include both representations.
+    try:
+        from bson import ObjectId
+        user_variants = [user_id, ObjectId(user_id)] if ObjectId.is_valid(user_id) else [user_id]
+    except Exception:
+        user_variants = [user_id]
 
-    progress_counts = {
-        str(x["_id"]): x["count"]
-        for x in db.progress.aggregate([
-            {"$match": {"user_id": {"$in": student_ids}, "completed": True}},
-            {"$group": {"_id": "$user_id", "count": {"$sum": 1}}}
-        ])
+    if not progress:
+        progress = list(db.progress.find(
+            {"user_id": {"$in": user_variants}, "completed": True},
+            {"course_id": 1, "lesson_id": 1, "completed_at": 1, "updated_at": 1, "created_at": 1}
+        ))
+
+    attempts = list(db.test_attempts.find(
+        {"user_id": {"$in": user_variants}, "status": "submitted"},
+        {"result": 1, "submitted_at": 1, "created_at": 1, "updated_at": 1}
+    ))
+
+    enrollments = db.enrollments.count_documents({
+        "user_id": {"$in": user_variants},
+        "status": "active"
+    })
+
+    scores = [
+        float((x.get("result") or {}).get("percentage", 0) or 0)
+        for x in attempts
+    ]
+    passed = sum(
+        1 for x in attempts
+        if bool((x.get("result") or {}).get("passed"))
+    )
+    average_score = round(sum(scores) / len(scores), 1) if scores else 0
+
+    completed_course_ids = list({
+        str(x.get("course_id"))
+        for x in progress
+        if x.get("course_id") is not None
+    })
+
+    completed_courses = 0
+    if completed_course_ids:
+        lesson_totals = {
+            str(x["_id"]): int(x["n"])
+            for x in db.lessons.aggregate([
+                {"$match": {
+                    "is_published": True,
+                    "$expr": {"$in": [{"$toString": "$course_id"}, completed_course_ids]}
+                }},
+                {"$group": {"_id": {"$toString": "$course_id"}, "n": {"$sum": 1}}}
+            ])
+        }
+
+        progress_totals = {
+            str(x["_id"]): int(x["n"])
+            for x in db.progress.aggregate([
+                {"$match": {
+                    "completed": True,
+                    "user_id": {"$in": user_variants},
+                    "$expr": {"$in": [{"$toString": "$course_id"}, completed_course_ids]}
+                }},
+                {"$group": {"_id": {"$toString": "$course_id"}, "n": {"$sum": 1}}}
+            ])
+        }
+        completed_courses = sum(
+            1 for course_id, total in lesson_totals.items()
+            if total > 0 and progress_totals.get(course_id, 0) >= total
+        )
+
+    xp = len(progress) * 10 + passed * 50 + len(attempts) * 5 + completed_courses * 100
+
+    # Activity collection is optional in older databases.
+    recent_activity = []
+    try:
+        recent_activity = [
+            clean(x) for x in db.activity_events.find(
+                {"user_id": {"$in": user_variants}},
+                {"created_at": 1, "type": 1, "action": 1, "title": 1}
+            ).sort("created_at", -1).limit(30)
+        ]
+    except Exception:
+        recent_activity = []
+
+    result = {
+        "basic": {
+            "courses_enrolled": enrollments,
+            "courses_completed": completed_courses,
+            "lessons_completed": len(progress),
+            "quiz_attempts": len(attempts),
+            "quizzes_passed": passed,
+            "average_score": average_score,
+            "learning_hours": round((len(progress) * 10) / 60, 1),
+            "xp": xp,
+            "level": 1 + xp // 500,
+            "streak": calculate_streak(user_id),
+        },
+        "advanced": {
+            "courses_enrolled": enrollments,
+            "lessons_completed": len(progress),
+            "tests_taken": len(attempts),
+            "average_score": round(sum(scores) / len(scores), 2) if scores else 0,
+            "recent_activity": recent_activity,
+        },
     }
+    cache.set(key, result, TTL_ANALYTICS)
+    return result
 
-    attempt_stats = {
-        str(x["_id"]): {"count": x["count"], "passed": x["passed"]}
-        for x in db.test_attempts.aggregate([
-            {"$match": {"user_id": {"$in": student_ids}, "status": "submitted"}},
+
+@router.get("/leaderboard")
+def leaderboard(limit: int = 20, user=Depends(current_user)):
+    """Return a resilient, cached student leaderboard.
+
+    This endpoint intentionally avoids MongoDB operators that can fail on
+    legacy/mixed schemas. Activity collections are optional: if progress or
+    test_attempts contain incompatible legacy data, the leaderboard still
+    returns students with the activity that could be read.
+    """
+    db = get_db()
+    user_id = str(user.get("_id", ""))
+
+    try:
+        safe_limit = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        safe_limit = 20
+
+    cache_key = "leaderboard:all:v4"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        rows = cached.get("rows") or []
+        me = next((r for r in rows if str(r.get("id")) == user_id), None)
+        return {
+            "items": rows[:safe_limit],
+            "me": me,
+            "total_students": len(rows),
+        }
+
+    # --------------------------------------------------------
+    # 1. Read students defensively.
+    # --------------------------------------------------------
+    students = []
+    try:
+        cursor = db.users.find(
+            {"role": "student"},
+            {"_id": 1, "name": 1, "email": 1, "is_active": 1},
+        ).limit(2000)
+        students = list(cursor)
+    except Exception:
+        # Some older deployments may have a different role representation.
+        # Fall back to users that are not administrative accounts.
+        try:
+            cursor = db.users.find(
+                {"role": {"$nin": ["admin", "root_admin", "content_admin", "instructor", "support_admin"]}},
+                {"_id": 1, "name": 1, "email": 1, "is_active": 1},
+            ).limit(2000)
+            students = list(cursor)
+        except Exception:
+            students = []
+
+    # Never make the page fail just because leaderboard data is unavailable.
+    if not students:
+        result = {"items": [], "me": None, "total_students": 0}
+        cache.set(cache_key, {"rows": []}, TTL_LEADERBOARD)
+        return result
+
+    # --------------------------------------------------------
+    # 2. Build both ObjectId and string forms of every user id.
+    # --------------------------------------------------------
+    raw_ids = [x.get("_id") for x in students if x.get("_id") is not None]
+    lookup_ids = []
+    seen = set()
+    for value in raw_ids:
+        candidates = [value, str(value)]
+        for candidate in candidates:
+            marker = repr(candidate)
+            if marker not in seen:
+                seen.add(marker)
+                lookup_ids.append(candidate)
+
+    # --------------------------------------------------------
+    # 3. Aggregate completed lessons.
+    # --------------------------------------------------------
+    progress_counts = {}
+    try:
+        for item in db.progress.aggregate([
+            {"$match": {
+                "completed": True,
+                "user_id": {"$in": lookup_ids},
+            }},
+            {"$group": {
+                "_id": "$user_id",
+                "count": {"$sum": 1},
+            }},
+        ]):
+            key = str(item.get("_id")) if item.get("_id") is not None else None
+            if key:
+                progress_counts[key] = progress_counts.get(key, 0) + int(item.get("count", 0) or 0)
+    except Exception:
+        # Legacy/missing progress collection must not break leaderboard.
+        progress_counts = {}
+
+    # --------------------------------------------------------
+    # 4. Aggregate submitted tests.
+    # --------------------------------------------------------
+    attempt_stats = {}
+    try:
+        for item in db.test_attempts.aggregate([
+            {"$match": {
+                "status": "submitted",
+                "user_id": {"$in": lookup_ids},
+            }},
             {"$group": {
                 "_id": "$user_id",
                 "count": {"$sum": 1},
@@ -171,38 +362,66 @@ def leaderboard(limit: int = 20, user=Depends(current_user)):
                         "$cond": [
                             {"$eq": ["$result.passed", True]},
                             1,
-                            0
+                            0,
                         ]
                     }
+                },
+            }},
+        ]):
+            key = str(item.get("_id")) if item.get("_id") is not None else None
+            if key:
+                attempt_stats[key] = {
+                    "count": int(item.get("count", 0) or 0),
+                    "passed": int(item.get("passed", 0) or 0),
                 }
-            }}
-        ])
-    }
+    except Exception:
+        attempt_stats = {}
 
+    # --------------------------------------------------------
+    # 5. Build deterministic ranking.
+    # --------------------------------------------------------
     rows = []
     for student in students:
-        sid = str(student["_id"])
+        sid = str(student.get("_id", ""))
+        if not sid:
+            continue
+
+        # Treat an explicit inactive flag as inactive, but preserve legacy
+        # users where the field is absent.
+        if student.get("is_active") is False:
+            continue
+
         lessons = progress_counts.get(sid, 0)
         stats = attempt_stats.get(sid, {"count": 0, "passed": 0})
-        attempts = stats["count"]
-        passed = stats["passed"]
+        attempts = stats.get("count", 0)
+        passed = stats.get("passed", 0)
+        xp = (lessons * 10) + (passed * 50) + (attempts * 5)
+
         rows.append({
             "id": sid,
-            "name": student.get("name", "Student"),
-            "xp": lessons * 10 + passed * 50 + attempts * 5,
-            "lessons": lessons,
-            "tests": attempts,
+            "name": str(student.get("name") or "Student"),
+            "xp": int(xp),
+            "lessons": int(lessons),
+            "tests": int(attempts),
         })
 
-    rows.sort(key=lambda x: x["xp"], reverse=True)
-    for rank, row in enumerate(rows, 1):
+    rows.sort(key=lambda row: (
+        -row["xp"],
+        row["name"].lower(),
+        row["id"],
+    ))
+
+    for rank, row in enumerate(rows, start=1):
         row["rank"] = rank
 
-    result = {"items": rows[:safe_limit]}
-    cache.set(key, result, TTL_LEADERBOARD)
-    result["me"] = next((x for x in rows if x["id"] == user_id), None)
-    return result
+    cache.set(cache_key, {"rows": rows}, TTL_LEADERBOARD)
 
+    me = next((r for r in rows if r["id"] == user_id), None)
+    return {
+        "items": rows[:safe_limit],
+        "me": me,
+        "total_students": len(rows),
+    }
 
 @router.get("/notifications")
 def notifications(user=Depends(current_user)):
@@ -247,6 +466,7 @@ def add_bookmark(data: dict, user=Depends(current_user)):
     d = {"_id": uuid.uuid4().hex, "user_id": user_id, "item_type": item_type, "item_id": item_id, "title": data.get("title", ""), "created_at": now()}
     db.bookmarks.insert_one(d)
     cache.delete_prefix(f"bookmarks:{user_id}")
+    cache.delete_prefix(f"course:overview:{user_id}:")
     return clean(d)
 
 @router.delete("/bookmarks/{bookmark_id}")
@@ -255,6 +475,7 @@ def delete_bookmark(bookmark_id: str, user=Depends(current_user)):
     if not result.deleted_count:
         raise HTTPException(404, "Bookmark not found")
     cache.delete_prefix(f"bookmarks:{uid(user)}")
+    cache.delete_prefix(f"course:overview:{uid(user)}:")
     return {"message": "Bookmark removed"}
 
 @router.get("/courses/{course_id}/reviews")
@@ -370,6 +591,8 @@ def issue_certificate(course_id: str, user=Depends(current_user)):
     certificate_id = f"SLL-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
     d = {"_id": uuid.uuid4().hex, "certificate_id": certificate_id, "user_id": user_id, "course_id": course_id, "course_name": course.get("name") or course.get("title"), "student_name": user.get("name", "Student"), "issued_at": now()}
     db.certificates.insert_one(d)
+    cache.delete_prefix(f"certificates:{user_id}")
+    cache.delete_prefix(f"course:overview:{user_id}:")
     return clean(d)
 
 @router.post("/certificates/{certificate_id}/access")

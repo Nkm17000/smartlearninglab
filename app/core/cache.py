@@ -74,6 +74,9 @@ TTL_RESULTS = 30
 TTL_PROGRESS = 15
 TTL_NOTES = 30
 TTL_ENROLLMENTS = 60
+TTL_LESSON_VIEW = 60
+TTL_LEARNING_SUMMARY = 30
+TTL_ANALYTICS_SUMMARY = 60
 
 
 def invalidate_user(user_id: str):
@@ -91,6 +94,14 @@ def invalidate_user(user_id: str):
         f"conversations:{user_id}",
         f"flashcards:{user_id}",
         f"badges:{user_id}",
+        f"learning_summary:{user_id}",
+        f"analytics_summary:{user_id}",
+        f"lesson_view:{user_id}:",
+        f"course:overview:{user_id}:",
+        f"course_progress:{user_id}:",
     )
     for prefix in prefixes:
         cache.delete_prefix(prefix)
+    # Leaderboard is shared across users, so invalidate it after any
+    # learning mutation that can change XP/rank.
+    cache.delete_prefix("leaderboard:")
