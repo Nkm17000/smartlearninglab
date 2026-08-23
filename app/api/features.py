@@ -3,6 +3,7 @@ import re, uuid, math, os, json, urllib.request
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.security import current_user, admin_user
 from app.db.mongo import get_db
+from app.core.cache import cache, TTL_PERSONALIZED_PATH, TTL_FLASHCARDS, TTL_ADVANCED_ANALYTICS
 
 router = APIRouter(prefix='/api/v1', tags=['AI & Advanced Learning'])
 
@@ -126,6 +127,155 @@ def speaking(data:dict,user=Depends(current_user)):
     overall=round((grammar+vocab+fluency+pronunciation)/4)
     return {'target':target,'transcript':transcript,'scores':{'grammar':grammar,'vocabulary':vocab,'fluency':fluency,'pronunciation':pronunciation,'overall':overall},'feedback':['Use complete sentences.','Add specific examples to make your answers stronger.','Practice speaking aloud for 5–10 minutes daily.']}
 
+# ---------------- Personalized Learning Path ----------------
+@router.get('/personalized/path')
+def personalized_path(user=Depends(current_user)):
+    """Build a resilient, data-backed learning plan for the student UI."""
+    db = get_db(); user_id = uid(user)
+    cache_key = f'personalized:{user_id}'
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    attempts = list(db.test_attempts.find({'user_id': user_id, 'status': 'submitted'}).sort('submitted_at', -1))
+    weak = []
+    percentages = []
+    for a in attempts:
+        result = a.get('result') or {}
+        try:
+            pct = float(result.get('percentage', 0) or 0)
+        except Exception:
+            pct = 0
+        percentages.append(pct)
+        if pct < 70:
+            quiz_id = str(a.get('test_id') or a.get('quiz_id') or '')
+            quiz = get_doc('quizzes', quiz_id) if quiz_id else None
+            weak.append({
+                'quiz_id': quiz_id,
+                'score': pct,
+                'topic': (quiz or {}).get('title') or (quiz or {}).get('name') or 'Quiz review'
+            })
+
+    enrollments = list(db.enrollments.find({'user_id': user_id, 'status': 'active'}))
+    enrolled_ids = [str(e.get('course_id')) for e in enrollments if e.get('course_id') is not None]
+
+    lessons_query = {'is_published': True}
+    if enrolled_ids:
+        lessons_query['course_id'] = {'$in': enrolled_ids}
+    lessons = list(db.lessons.find(lessons_query).sort('order', 1).limit(30))
+
+    completed = list(db.progress.find({'user_id': user_id, 'completed': True}))
+    completed_ids = {str(x.get('lesson_id')) for x in completed}
+    total_lessons = len(lessons)
+    completed_lessons = len(completed_ids)
+    overall = round(completed_lessons * 100 / total_lessons, 2) if total_lessons else 0
+
+    # Weekly activity and a small, deterministic XP model shared by the UI.
+    today = datetime.now(timezone.utc).date()
+    week_start = today - timedelta(days=today.weekday())
+    weekly_completed = 0
+    today_completed = 0
+    active_dates = set()
+    for p in completed:
+        raw = p.get('completed_at') or p.get('updated_at') or p.get('created_at')
+        if not raw:
+            continue
+        try:
+            d = raw.date() if hasattr(raw, 'date') else datetime.fromisoformat(str(raw).replace('Z', '+00:00')).date()
+            active_dates.add(d)
+            if d >= week_start:
+                weekly_completed += 1
+            if d == today:
+                today_completed += 1
+        except Exception:
+            continue
+
+    streak = 0
+    cursor = today
+    while cursor in active_dates:
+        streak += 1
+        cursor -= timedelta(days=1)
+
+    passed = sum(1 for a in attempts if bool((a.get('result') or {}).get('passed')))
+    avg = round(sum(percentages) / len(percentages), 2) if percentages else 0
+    flashcards_reviewed = db.flashcard_reviews.count_documents({'user_id': user_id})
+    game_sessions = list(db.game_sessions.find({'user_id': user_id, 'status': 'completed'}))
+    game_xp = sum(int(x.get('xp_earned', 0) or 0) for x in game_sessions)
+    xp = len(completed) * 10 + len(attempts) * 5 + passed * 50 + game_xp
+
+    next_steps = []
+    for lesson in lessons:
+        lid = str(lesson.get('_id'))
+        if lid in completed_ids:
+            continue
+        item = clean(lesson)
+        item['type'] = 'lesson'
+        item['course_id'] = str(lesson.get('course_id')) if lesson.get('course_id') is not None else None
+        item['progress_percentage'] = 0
+        item['duration_minutes'] = int(lesson.get('duration_minutes', 25) or 25)
+        item['badge'] = 'Weak Area' if weak and len(next_steps) == 0 else ('Recommended' if len(next_steps) == 1 else 'Review')
+        next_steps.append(item)
+        if len(next_steps) >= 6:
+            break
+
+    # If the learner has no enrollment yet, still provide published lessons as
+    # discoverable recommendations rather than leaving the page blank.
+    if not next_steps:
+        for lesson in db.lessons.find({'is_published': True}).sort('order', 1).limit(6):
+            item = clean(lesson)
+            item['type'] = 'lesson'
+            item['course_id'] = str(lesson.get('course_id')) if lesson.get('course_id') is not None else None
+            item['progress_percentage'] = 0
+            item['duration_minutes'] = int(lesson.get('duration_minutes', 25) or 25)
+            item['badge'] = 'Recommended'
+            next_steps.append(item)
+
+    achievements = [
+        {'icon': '⭐', 'title': 'Consistent Learner', 'subtitle': f'{streak} day streak'},
+        {'icon': '🏆', 'title': 'Quiz Master', 'subtitle': f'{passed} quizzes passed'},
+        {'icon': '⚡', 'title': 'Quick Learner', 'subtitle': f'{completed_lessons} lessons completed'},
+        {'icon': '🃏', 'title': 'Flashcard Pro', 'subtitle': f'{flashcards_reviewed} cards reviewed'},
+    ]
+
+    enrolled_course_ids = [str(e.get('course_id')) for e in enrollments if e.get('course_id') is not None]
+    completed_counts = {}
+    lesson_counts = {}
+    if enrolled_course_ids:
+        for row in db.progress.aggregate([
+            {'$match': {'user_id': user_id, 'course_id': {'$in': enrolled_course_ids}, 'completed': True}},
+            {'$group': {'_id': '$course_id', 'n': {'$sum': 1}}}
+        ]):
+            completed_counts[str(row['_id'])] = row['n']
+        for row in db.lessons.aggregate([
+            {'$match': {'course_id': {'$in': enrolled_course_ids}, 'is_published': True}},
+            {'$group': {'_id': '$course_id', 'n': {'$sum': 1}}}
+        ]):
+            lesson_counts[str(row['_id'])] = row['n']
+    courses_completed = sum(1 for cid in enrolled_course_ids if lesson_counts.get(cid, 0) > 0 and completed_counts.get(cid, 0) >= lesson_counts.get(cid, 0))
+
+    result = {
+        'summary': 'Personalized recommendations based on your progress and recent assessment performance.',
+        'weak_areas': weak[:6],
+        'next_steps': next_steps,
+        'daily_goal_minutes': 20,
+        'today_minutes': today_completed * 10,
+        'weekly_goal_lessons': 5,
+        'weekly_completed_lessons': weekly_completed,
+        'overall_progress': overall,
+        'courses_completed': courses_completed,
+        'courses_total': len(enrollments),
+        'quizzes_completed': len(attempts),
+        'quizzes_passed': passed,
+        'flashcards_reviewed': flashcards_reviewed,
+        'accuracy': avg,
+        'study_hours': f'{(len(completed) * 25) // 60}h {(len(completed) * 25) % 60}m',
+        'streak_days': streak,
+        'xp': xp,
+        'achievements': achievements,
+    }
+    cache.set(cache_key, result, TTL_PERSONALIZED_PATH)
+    return result
+
 # ---------------- Adaptive Tests ----------------
 @router.post('/adaptive/tests/submit')
 def adaptive_submit(data:dict,user=Depends(current_user)):
@@ -191,13 +341,18 @@ def adaptive_test(data:dict,user=Depends(current_user)):
 # ---------------- Flashcards + Spaced Repetition ----------------
 @router.get('/flashcards')
 def flashcards(user=Depends(current_user)):
-    return [clean(x) for x in get_db().flashcards.find({'user_id':uid(user)}).sort('due_at',1)]
+    user_id = uid(user); key = f"flashcards:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    result = [clean(x) for x in get_db().flashcards.find({'user_id':user_id}).sort('due_at',1)]
+    cache.set(key, result, TTL_FLASHCARDS)
+    return result
 
 @router.post('/flashcards')
 def create_flashcard(data:dict,user=Depends(current_user)):
     if not data.get('front') or not data.get('back'): raise HTTPException(422,'front and back are required')
     d={'_id':uuid.uuid4().hex,'user_id':uid(user),'front':data['front'],'back':data['back'],'course_id':data.get('course_id'),'ease':2.5,'interval_days':1,'repetitions':0,'due_at':now(),'created_at':now()}
-    get_db().flashcards.insert_one(d); return clean(d)
+    get_db().flashcards.insert_one(d); cache.delete_prefix(f"flashcards:{uid(user)}"); return clean(d)
 
 @router.delete('/flashcards/{card_id}')
 def delete_flashcard(card_id: str, user=Depends(current_user)):
@@ -207,6 +362,7 @@ def delete_flashcard(card_id: str, user=Depends(current_user)):
     if not card:
         raise HTTPException(404, 'Flashcard not found')
     db.flashcards.delete_one({'_id': card['_id']})
+    cache.delete_prefix(f"flashcards:{user_id}")
     return {'message': 'Flashcard deleted', 'id': str(card['_id'])}
 
 @router.post('/flashcards/{card_id}/review')
@@ -219,11 +375,16 @@ def review_flashcard(card_id:str,data:dict,user=Depends(current_user)):
         reps+=1; interval=1 if reps==1 else 6 if reps==2 else max(1,round(interval*ease))
         ease=max(1.3,ease+0.1-(5-quality)*(0.08+(5-quality)*0.02))
     d={'repetitions':reps,'interval_days':interval,'ease':ease,'due_at':now()+timedelta(days=interval),'last_quality':quality,'updated_at':now()}
-    db.flashcards.update_one({'_id':card_id},{'$set':d}); return clean(db.flashcards.find_one({'_id':card_id}))
+    db.flashcards.update_one({'_id':card_id},{'$set':d}); cache.delete_prefix(f"flashcards:{uid(user)}"); return clean(db.flashcards.find_one({'_id':card_id}))
 
 @router.get('/flashcards/due')
 def due_flashcards(user=Depends(current_user)):
-    return [clean(x) for x in get_db().flashcards.find({'user_id':uid(user),'due_at':{'$lte':now()}}).sort('due_at',1)]
+    user_id = uid(user); key = f"flashcards_due:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    result = [clean(x) for x in get_db().flashcards.find({'user_id':user_id,'due_at':{'$lte':now()}}).sort('due_at',1)]
+    cache.set(key, result, 15)
+    return result
 
 # ---------------- Interview Preparation ----------------
 INTERVIEW_TOPICS={'java':['Explain HashMap internals.','What is the difference between synchronized and Lock?','Explain JVM memory areas.'],'spring':['Explain dependency injection.','What is Spring Boot auto-configuration?','How do you design resilient microservices?'],'ai':['What is RAG?','Explain embeddings.','How would you evaluate an LLM application?'],'general':['Tell me about yourself.','Describe a difficult technical problem you solved.','How do you handle production incidents?']}
@@ -243,10 +404,17 @@ def interview_evaluate(data:dict,user=Depends(current_user)):
 # ---------------- Advanced Analytics ----------------
 @router.get('/analytics/advanced')
 def advanced_analytics(user=Depends(current_user)):
+    user_id = uid(user)
+    key = f"advanced_analytics:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
     db=get_db(); user_id=uid(user)
     enroll=db.enrollments.count_documents({'user_id':user_id}); lessons=db.progress.count_documents({'user_id':user_id,'completed':True}); attempts=list(db.test_attempts.find({'user_id':user_id,'status':'submitted'})); avg=round(sum(float(x.get('result',{}).get('percentage',0)) for x in attempts)/len(attempts),2) if attempts else 0
     activity=list(db.activity_events.find({'user_id':user_id}).sort('created_at',-1).limit(30))
-    return {'courses_enrolled':enroll,'lessons_completed':lessons,'tests_taken':len(attempts),'average_score':avg,'recent_activity':[clean(x) for x in activity]}
+    result = {'courses_enrolled':enroll,'lessons_completed':lessons,'tests_taken':len(attempts),'average_score':avg,'recent_activity':[clean(x) for x in activity]}
+    cache.set(key, result, TTL_ADVANCED_ANALYTICS)
+    return result
+
 
 @router.get('/admin/analytics/advanced')
 def admin_advanced_analytics(user=Depends(admin_user)):

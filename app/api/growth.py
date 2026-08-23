@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from app.core.security import current_user, admin_user
 from app.db.mongo import get_db
+from app.core.cache import cache, TTL_ANALYTICS, TTL_LEADERBOARD, TTL_BOOKMARKS, TTL_CERTIFICATES, TTL_NOTIFICATIONS, TTL_BADGES, invalidate_user
 
 router = APIRouter(prefix="/api/v1", tags=["Platform Growth"])
 
@@ -92,6 +93,10 @@ def calculate_streak(user_id):
 @router.get("/analytics")
 def student_analytics(user=Depends(current_user)):
     db = get_db(); user_id = uid(user)
+    key = f"analytics:{user_id}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
     progress = list(db.progress.find({"user_id": user_id, "completed": True}))
     attempts = list(db.test_attempts.find({"user_id": user_id, "status": "submitted"}))
     enrollments = db.enrollments.count_documents({"user_id": user_id, "status": "active"})
@@ -106,7 +111,7 @@ def student_analytics(user=Depends(current_user)):
     avg = round(sum(scores) / len(scores), 1) if scores else 0
     passed = sum(1 for x in attempts if x.get("result", {}).get("passed"))
     xp = len(progress) * 10 + passed * 50 + len(attempts) * 5 + completed_courses * 100
-    return {
+    result = {
         "courses_enrolled": enrollments,
         "courses_completed": completed_courses,
         "lessons_completed": len(progress),
@@ -118,27 +123,95 @@ def student_analytics(user=Depends(current_user)):
         "level": 1 + xp // 500,
         "streak": calculate_streak(user_id),
     }
+    cache.set(key, result, TTL_ANALYTICS)
+    return result
 
 @router.get("/leaderboard")
 def leaderboard(limit: int = 20, user=Depends(current_user)):
     db = get_db()
-    students = list(db.users.find({"role": "student", "is_active": True}, {"password_hash": 0}).limit(500))
+    user_id = uid(user)
+    safe_limit = max(1, min(limit, 100))
+    key = f"leaderboard:{safe_limit}"
+    cached = cache.get(key)
+    if cached is not None:
+        result = dict(cached)
+        result["me"] = next((x for x in result["items"] if x["id"] == user_id), None)
+        return result
+
+    # One query for students + one aggregation per activity collection.
+    # Avoids the previous per-student count/find N+1 pattern.
+    students = list(db.users.find(
+        {"role": "student", "is_active": True},
+        {"password_hash": 0, "name": 1}
+    ).limit(500))
+
+    student_ids = [str(s["_id"]) for s in students]
+    if not student_ids:
+        result = {"items": [], "me": None}
+        cache.set(key, {"items": []}, TTL_LEADERBOARD)
+        return result
+
+    progress_counts = {
+        str(x["_id"]): x["count"]
+        for x in db.progress.aggregate([
+            {"$match": {"user_id": {"$in": student_ids}, "completed": True}},
+            {"$group": {"_id": "$user_id", "count": {"$sum": 1}}}
+        ])
+    }
+
+    attempt_stats = {
+        str(x["_id"]): {"count": x["count"], "passed": x["passed"]}
+        for x in db.test_attempts.aggregate([
+            {"$match": {"user_id": {"$in": student_ids}, "status": "submitted"}},
+            {"$group": {
+                "_id": "$user_id",
+                "count": {"$sum": 1},
+                "passed": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$result.passed", True]},
+                            1,
+                            0
+                        ]
+                    }
+                }
+            }}
+        ])
+    }
+
     rows = []
     for student in students:
         sid = str(student["_id"])
-        lessons = db.progress.count_documents({"user_id": sid, "completed": True})
-        attempts = list(db.test_attempts.find({"user_id": sid, "status": "submitted"}))
-        passed = sum(1 for a in attempts if a.get("result", {}).get("passed"))
-        score = lessons * 10 + passed * 50 + len(attempts) * 5
-        rows.append({"id": sid, "name": student.get("name", "Student"), "xp": score, "lessons": lessons, "tests": len(attempts)})
+        lessons = progress_counts.get(sid, 0)
+        stats = attempt_stats.get(sid, {"count": 0, "passed": 0})
+        attempts = stats["count"]
+        passed = stats["passed"]
+        rows.append({
+            "id": sid,
+            "name": student.get("name", "Student"),
+            "xp": lessons * 10 + passed * 50 + attempts * 5,
+            "lessons": lessons,
+            "tests": attempts,
+        })
+
     rows.sort(key=lambda x: x["xp"], reverse=True)
-    for i, row in enumerate(rows, 1):
-        row["rank"] = i
-    return {"items": rows[:max(1, min(limit, 100))], "me": next((x for x in rows if x["id"] == uid(user)), None)}
+    for rank, row in enumerate(rows, 1):
+        row["rank"] = rank
+
+    result = {"items": rows[:safe_limit]}
+    cache.set(key, result, TTL_LEADERBOARD)
+    result["me"] = next((x for x in rows if x["id"] == user_id), None)
+    return result
+
 
 @router.get("/notifications")
 def notifications(user=Depends(current_user)):
-    return [clean(x) for x in get_db().notifications.find({"user_id": uid(user)}).sort("created_at", -1).limit(50)]
+    user_id = uid(user); key = f"notifications:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    result = [clean(x) for x in get_db().notifications.find({"user_id": user_id}).sort("created_at", -1).limit(50)]
+    cache.set(key, result, TTL_NOTIFICATIONS)
+    return result
 
 @router.post("/notifications/read")
 def mark_notifications_read(data: dict, user=Depends(current_user)):
@@ -146,13 +219,20 @@ def mark_notifications_read(data: dict, user=Depends(current_user)):
     notification_id = data.get("id")
     if notification_id:
         db.notifications.update_one({"_id": notification_id, "user_id": user_id}, {"$set": {"read": True}})
+        cache.delete_prefix(f"notifications:{user_id}")
     else:
         db.notifications.update_many({"user_id": user_id}, {"$set": {"read": True}})
+        cache.delete_prefix(f"notifications:{user_id}")
     return {"message": "Notifications updated"}
 
 @router.get("/bookmarks")
 def bookmarks(user=Depends(current_user)):
-    return [clean(x) for x in get_db().bookmarks.find({"user_id": uid(user)}).sort("created_at", -1)]
+    user_id = uid(user); key = f"bookmarks:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    result = [clean(x) for x in get_db().bookmarks.find({"user_id": user_id}).sort("created_at", -1)]
+    cache.set(key, result, TTL_BOOKMARKS)
+    return result
 
 @router.post("/bookmarks")
 def add_bookmark(data: dict, user=Depends(current_user)):
@@ -166,6 +246,7 @@ def add_bookmark(data: dict, user=Depends(current_user)):
         return clean(existing)
     d = {"_id": uuid.uuid4().hex, "user_id": user_id, "item_type": item_type, "item_id": item_id, "title": data.get("title", ""), "created_at": now()}
     db.bookmarks.insert_one(d)
+    cache.delete_prefix(f"bookmarks:{user_id}")
     return clean(d)
 
 @router.delete("/bookmarks/{bookmark_id}")
@@ -173,6 +254,7 @@ def delete_bookmark(bookmark_id: str, user=Depends(current_user)):
     result = get_db().bookmarks.delete_one({"_id": bookmark_id, "user_id": uid(user)})
     if not result.deleted_count:
         raise HTTPException(404, "Bookmark not found")
+    cache.delete_prefix(f"bookmarks:{uid(user)}")
     return {"message": "Bookmark removed"}
 
 @router.get("/courses/{course_id}/reviews")
@@ -265,7 +347,12 @@ def add_course_review(course_id: str, data: dict, user=Depends(current_user)):
 
 @router.get("/certificates")
 def certificates(user=Depends(current_user)):
-    return [clean(x) for x in get_db().certificates.find({"user_id": uid(user)}).sort("issued_at", -1)]
+    user_id = uid(user); key = f"certificates:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    result = [clean(x) for x in get_db().certificates.find({"user_id": user_id}).sort("issued_at", -1)]
+    cache.set(key, result, TTL_CERTIFICATES)
+    return result
 
 @router.post("/certificates/course/{course_id}/issue")
 def issue_certificate(course_id: str, user=Depends(current_user)):
@@ -428,6 +515,9 @@ def certificate_public_download(certificate_id: str, token: str):
 
 @router.get("/badges")
 def badges(user=Depends(current_user)):
+    user_id = uid(user); key = f"badges:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
     a = student_analytics(user)
     items = []
     if a["lessons_completed"] >= 1: items.append({"code":"first_lesson","name":"First Lesson","description":"Completed your first lesson","icon":"📖"})
@@ -435,6 +525,7 @@ def badges(user=Depends(current_user)):
     if a["quiz_attempts"] >= 5: items.append({"code":"test_taker","name":"Test Taker","description":"Attempted five tests","icon":"📝"})
     if a["streak"]["current"] >= 7: items.append({"code":"seven_day_streak","name":"7 Day Streak","description":"Learned for seven days in a row","icon":"🔥"})
     if a["xp"] >= 500: items.append({"code":"rising_star","name":"Rising Star","description":"Earned 500 XP","icon":"⭐"})
+    cache.set(key, items, TTL_BADGES)
     return items
 
 @router.get("/admin/analytics")

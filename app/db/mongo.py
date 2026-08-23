@@ -12,7 +12,15 @@ def get_client():
         s = get_settings()
         # Never print the MongoDB URI because it may contain credentials.
         logger.info("MONGODB_CLIENT_CREATE | serverSelectionTimeoutMS=10000")
-        _client = MongoClient(s.mongodb_uri, serverSelectionTimeoutMS=10000, connectTimeoutMS=5000, socketTimeoutMS=20000, maxPoolSize=40, minPoolSize=5, retryWrites=True)
+        _client = MongoClient(
+            s.mongodb_uri,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=15000,
+            maxPoolSize=50,
+            minPoolSize=5,
+            retryWrites=True,
+        )
     return _client
 
 

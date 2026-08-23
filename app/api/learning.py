@@ -3,6 +3,8 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.security import current_user
 from app.db.mongo import get_db
+from app.core.cache import (cache, TTL_DASHBOARD, TTL_COURSES, TTL_CATEGORIES,
+                            TTL_FEATURED, TTL_COURSE_OVERVIEW, TTL_QUIZZES, TTL_RESULTS, TTL_PROGRESS, TTL_NOTES, TTL_ENROLLMENTS, invalidate_user)
 
 router = APIRouter(prefix="/api/v1", tags=["Student Learning"])
 
@@ -70,181 +72,300 @@ def published(collection, item_id):
 
 def uid(user): return str(user["_id"])
 
-def _course_count_map(db, collection, match):
-    return {str(x["_id"]): int(x["count"]) for x in db[collection].aggregate([{"$match":match},{"$group":{"_id":"$course_id","count":{"$sum":1}}}]) if x.get("_id") is not None}
-
-def _build_dashboard(db,user):
-    user_id=uid(user)
-    progress=list(db.progress.find({"user_id":user_id},{"course_id":1,"lesson_id":1,"completed":1,"completed_at":1,"updated_at":1,"created_at":1}))
-    completed=[x for x in progress if x.get("completed")]
-    attempts=list(db.test_attempts.find({"user_id":user_id,"status":"submitted"},{"test_id":1,"result":1,"submitted_at":1}).sort("submitted_at",-1).limit(50))
-    enrollments=list(db.enrollments.find({"user_id":user_id,"status":"active"},{"course_id":1,"updated_at":1}).sort("updated_at",-1).limit(10))
-    ids=[str(x.get("course_id")) for x in enrollments if x.get("course_id") is not None]
-    courses=list(db.courses.find({"_id":{"$in":ids},"is_published":True},{"name":1,"title":1,"short_description":1,"description":1,"level":1,"category":1,"exam":1,"language":1,"thumbnail":1,"featured":1,"is_free":1,"created_at":1})) if ids else []
-    by={str(x.get("_id")):x for x in courses}; lc=_course_count_map(db,"lessons",{"course_id":{"$in":ids},"is_published":True}) if ids else {}; pc=_course_count_map(db,"progress",{"user_id":user_id,"course_id":{"$in":ids},"completed":True}) if ids else {}
-    done_by={}
-    for x in completed: done_by.setdefault(str(x.get("course_id")),set()).add(str(x.get("lesson_id")))
-    nexts={}
-    for x in (list(db.lessons.find({"course_id":{"$in":ids},"is_published":True},{"_id":1,"course_id":1,"title":1,"name":1,"order":1}).sort("order",1).limit(200)) if ids else []):
-        cid=str(x.get("course_id"));
-        if cid not in nexts and str(x.get("_id")) not in done_by.get(cid,set()): nexts[cid]=x
-    enrolled=[]; cont=None
-    for e in enrollments:
-        cid=str(e.get("course_id")); c=by.get(cid)
-        if not c: continue
-        total=lc.get(cid,0); done=pc.get(cid,0); item=clean(c); item.update({"is_enrolled":True,"lesson_count":total,"completed_lessons":done,"total_lessons":total,"progress_percentage":round(done*100/total,2) if total else 0}); enrolled.append(item)
-        if cont is None and cid in nexts:
-            x=nexts[cid]; cont={"course_id":cid,"course_title":c.get("name") or c.get("title") or "Course","lesson_id":str(x.get("_id")),"lesson_title":x.get("title") or x.get("name") or "Next lesson","progress_percentage":item["progress_percentage"]}
-    today=datetime.now(timezone.utc).date(); week=today-__import__('datetime').timedelta(days=today.weekday()); dates=set(); weekly=0
-    for x in completed:
-        raw=x.get("completed_at") or x.get("updated_at") or x.get("created_at")
-        try:
-            d=raw.date() if hasattr(raw,"date") else datetime.fromisoformat(str(raw).replace("Z","+00:00")).date(); dates.add(d); weekly+=d>=week
-        except Exception: pass
-    for x in attempts:
-        raw=x.get("submitted_at")
-        try: dates.add(raw.date() if hasattr(raw,"date") else datetime.fromisoformat(str(raw).replace("Z","+00:00")).date())
-        except Exception: pass
-    streak=0; cur=today
-    while cur in dates: streak+=1; cur-=__import__('datetime').timedelta(days=1)
-    pct=[float((x.get("result") or {}).get("percentage",0) or 0) for x in attempts]; avg=round(sum(pct)/len(pct),2) if pct else 0; passed=sum(1 for x in attempts if bool((x.get("result") or {}).get("passed"))); completed_courses=sum(1 for x in enrolled if x["total_lessons"] and x["completed_lessons"]>=x["total_lessons"]); xp=len(completed)*10+len(attempts)*5+passed*50+completed_courses*100
-    return {"user":{"id":user_id,"name":user.get("name"),"email":user.get("email"),"role":user.get("role")},"courses_available":db.courses.count_documents({"is_published":True}),"lessons_completed":len(completed),"quiz_attempts":len(attempts),"quiz_average":avg,"xp":xp,"streak":{"current":streak},"enrolled_courses":enrolled,"continue_learning":cont,"weekly_goal":{"target":5,"completed":weekly,"percentage":min(100,round(weekly*20))},"recent_quiz_results":[clean(x) for x in attempts[:5]]}
-
 @router.get("/dashboard")
-def dashboard(user=Depends(current_user)): return _build_dashboard(get_db(),user)
+def dashboard(user=Depends(current_user)):
+    """Fast dashboard: batch-loads user data and enrolled-course content."""
+    db = get_db(); user_id = uid(user)
+    key = f"dashboard:{user_id}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    progress = list(db.progress.find(
+        {"user_id": user_id},
+        {"course_id": 1, "lesson_id": 1, "completed": 1, "completed_at": 1, "updated_at": 1, "created_at": 1}
+    ))
+    completed_progress = [p for p in progress if p.get("completed")]
+    completed_ids_by_course = {}
+    for p in completed_progress:
+        completed_ids_by_course.setdefault(str(p.get("course_id")), set()).add(str(p.get("lesson_id")))
+
+    attempts = list(db.test_attempts.find(
+        {"user_id": user_id, "status": "submitted"},
+        {"result": 1, "submitted_at": 1, "created_at": 1, "updated_at": 1}
+    ).sort("submitted_at", -1))
+    percentages = [float((a.get("result") or {}).get("percentage", 0) or 0) for a in attempts]
+    avg = round(sum(percentages) / len(percentages), 2) if percentages else 0
+
+    enrollments = list(db.enrollments.find(
+        {"user_id": user_id, "status": "active"},
+        {"course_id": 1, "updated_at": 1, "created_at": 1}
+    ).sort("updated_at", -1).limit(10))
+    course_ids = [str(e.get("course_id")) for e in enrollments if e.get("course_id") is not None]
+
+    courses = list(db.courses.find({"_id": {"$in": course_ids}})) if course_ids else []
+    by_course = {str(c.get("_id")): c for c in courses}
+    lessons = list(db.lessons.find(
+        {"course_id": {"$in": course_ids}, "is_published": True},
+        {"_id": 1, "course_id": 1, "title": 1, "name": 1, "order": 1}
+    ).sort("order", 1)) if course_ids else []
+    lessons_by_course = {}
+    for lesson in lessons:
+        lessons_by_course.setdefault(str(lesson.get("course_id")), []).append(lesson)
+
+    enrolled_courses = []
+    continue_learning = None
+    for course_id in course_ids:
+        c = by_course.get(course_id)
+        if not c:
+            continue
+        course_lessons = lessons_by_course.get(course_id, [])
+        done_ids = completed_ids_by_course.get(course_id, set())
+        total = len(course_lessons)
+        done = sum(1 for x in course_lessons if str(x.get("_id")) in done_ids)
+        percentage = round(done * 100 / total, 2) if total else 0
+        item = clean(c)
+        item.update({"progress_percentage": percentage, "completed_lessons": done, "total_lessons": total})
+        enrolled_courses.append(item)
+
+        if continue_learning is None:
+            next_lesson = next((x for x in course_lessons if str(x.get("_id")) not in done_ids), None)
+            if next_lesson:
+                continue_learning = {
+                    "course_id": course_id,
+                    "course_title": c.get("name") or c.get("title") or "Course",
+                    "lesson_id": str(next_lesson.get("_id")),
+                    "lesson_title": next_lesson.get("title") or next_lesson.get("name") or "Next lesson",
+                    "progress_percentage": percentage,
+                }
+
+    today = datetime.now(timezone.utc).date()
+    week_start = today - __import__('datetime').timedelta(days=today.weekday())
+    active_dates = set()
+    weekly_completed = 0
+    for p in completed_progress:
+        raw = p.get("completed_at") or p.get("updated_at") or p.get("created_at")
+        try:
+            d = raw.date() if hasattr(raw, "date") else datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+            active_dates.add(d)
+            if d >= week_start:
+                weekly_completed += 1
+        except Exception:
+            pass
+    for a in attempts:
+        raw = a.get("submitted_at") or a.get("updated_at") or a.get("created_at")
+        try:
+            active_dates.add(raw.date() if hasattr(raw, "date") else datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date())
+        except Exception:
+            pass
+    for e in enrollments:
+        raw = e.get("updated_at") or e.get("created_at")
+        try:
+            active_dates.add(raw.date() if hasattr(raw, "date") else datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date())
+        except Exception:
+            pass
+
+    streak = 0
+    cursor = today
+    while cursor in active_dates:
+        streak += 1
+        cursor -= __import__('datetime').timedelta(days=1)
+
+    passed = sum(1 for a in attempts if (a.get("result") or {}).get("passed"))
+    completed_courses = sum(1 for x in enrolled_courses if x.get("total_lessons") and x.get("completed_lessons", 0) >= x.get("total_lessons"))
+    xp = len(completed_progress) * 10 + passed * 50 + len(attempts) * 5 + completed_courses * 100
+
+    result = {
+        "user": {"id": user_id, "name": user.get("name"), "email": user.get("email"), "role": user.get("role")},
+        "courses_available": db.courses.count_documents({"is_published": True}),
+        "lessons_completed": len(completed_progress),
+        "quiz_attempts": len(attempts),
+        "quiz_average": avg,
+        "xp": xp,
+        "streak": {"current": streak},
+        "enrolled_courses": enrolled_courses,
+        "continue_learning": continue_learning,
+        "weekly_goal": {"target": 5, "completed": weekly_completed, "percentage": min(100, round(weekly_completed * 100 / 5))},
+        "recent_quiz_results": [clean(x) for x in attempts[:5]],
+    }
+    cache.set(key, result, TTL_DASHBOARD)
+    return result
 
 @router.get("/home")
-def home(limit:int=Query(10,ge=1,le=20),user=Depends(current_user)):
-    db=get_db(); courses=[clean(x) for x in db.courses.find({"is_published":True},{"name":1,"title":1,"short_description":1,"description":1,"level":1,"category":1,"exam":1,"is_free":1,"thumbnail":1,"featured":1,"created_at":1,"video_count":1,"mock_test_count":1,"pdf_count":1}).sort([("featured",-1),("created_at",-1)]).limit(limit)]; quizzes=[clean(x) for x in db.quizzes.find({"is_published":True},{"title":1,"name":1,"duration_minutes":1,"question_ids":1,"featured":1,"created_at":1}).sort([("featured",-1),("created_at",-1)]).limit(6)]; catalog={"categories":sorted([x for x in db.courses.distinct("category",{"is_published":True}) if x]),"exams":sorted([x for x in db.courses.distinct("exam",{"is_published":True}) if x])}; return {"dashboard":_build_dashboard(db,user),"courses":courses,"quizzes":quizzes,"catalog":catalog}
-
-def _learning_plan(db,user):
-    user_id=uid(user); attempts=list(db.test_attempts.find({"user_id":user_id,"status":"submitted"},{"test_id":1,"result":1,"submitted_at":1}).sort("submitted_at",-1).limit(30)); ids=[str(x.get("test_id")) for x in attempts if x.get("test_id")]; qzs=list(db.quizzes.find({"_id":{"$in":ids}},{"title":1,"name":1})) if ids else []; qby={str(x.get("_id")):x for x in qzs}; weak=[]; pcts=[]
-    for a in attempts:
-        r=a.get("result") or {}; pct=float(r.get("percentage",0) or 0); pcts.append(pct);
-        if pct<70: weak.append({"quiz_id":str(a.get("test_id") or ""),"score":pct,"topic":(qby.get(str(a.get("test_id"))) or {}).get("title") or (qby.get(str(a.get("test_id"))) or {}).get("name") or "Quiz review"})
-    completed=list(db.progress.find({"user_id":user_id,"completed":True},{"course_id":1,"lesson_id":1,"completed_at":1,"updated_at":1,"created_at":1})); completed_ids={str(x.get("lesson_id")) for x in completed}; enroll=list(db.enrollments.find({"user_id":user_id,"status":"active"},{"course_id":1}).limit(30)); eids=[str(x.get("course_id")) for x in enroll if x.get("course_id") is not None]; lessons=list(db.lessons.find({"is_published":True,"course_id":{"$in":eids}},{"_id":1,"course_id":1,"title":1,"name":1,"description":1,"duration_minutes":1,"order":1}).sort("order",1).limit(60)) if eids else []; overall=round(len(completed_ids)*100/len(lessons),2) if lessons else 0; today=datetime.now(timezone.utc).date(); week=today-__import__('datetime').timedelta(days=today.weekday()); weekly=0; today_done=0; dates=set()
-    for x in completed:
-        raw=x.get("completed_at") or x.get("updated_at") or x.get("created_at")
-        try:
-            d=raw.date() if hasattr(raw,"date") else datetime.fromisoformat(str(raw).replace("Z","+00:00")).date(); dates.add(d); weekly+=d>=week; today_done+=d==today
-        except Exception: pass
-    for a in attempts:
-        raw=a.get("submitted_at")
-        try: dates.add(raw.date() if hasattr(raw,"date") else datetime.fromisoformat(str(raw).replace("Z","+00:00")).date())
-        except Exception: pass
-    streak=0; cur=today
-    while cur in dates: streak+=1; cur-=__import__('datetime').timedelta(days=1)
-    passed=sum(1 for a in attempts if bool((a.get("result") or {}).get("passed"))); avg=round(sum(pcts)/len(pcts),2) if pcts else 0; flash=db.flashcard_reviews.count_documents({"user_id":user_id}); lc=_course_count_map(db,"lessons",{"course_id":{"$in":eids},"is_published":True}) if eids else {}; pc=_course_count_map(db,"progress",{"user_id":user_id,"course_id":{"$in":eids},"completed":True}) if eids else {}; cc=sum(1 for cid in eids if lc.get(cid,0)>0 and pc.get(cid,0)>=lc.get(cid,0)); nexts=[]
-    for l in lessons:
-        if str(l.get("_id")) in completed_ids: continue
-        x=clean(l); x.update({"type":"lesson","course_id":str(l.get("course_id")),"progress_percentage":0,"duration_minutes":int(l.get("duration_minutes",25) or 25),"badge":"Weak Area" if weak and not nexts else ("Recommended" if len(nexts)==1 else "Review")}); nexts.append(x)
-        if len(nexts)>=6: break
-    xp=len(completed)*10+len(attempts)*5+passed*50; return {"summary":"Personalized recommendations based on your progress and recent assessment performance.","weak_areas":weak[:6],"next_steps":nexts,"daily_goal_minutes":20,"today_minutes":today_done*10,"weekly_goal_lessons":5,"weekly_completed_lessons":weekly,"overall_progress":overall,"courses_completed":cc,"courses_total":len(enroll),"quizzes_completed":len(attempts),"quizzes_passed":passed,"flashcards_reviewed":flash,"accuracy":avg,"study_hours":f"{(len(completed)*25)//60}h {(len(completed)*25)%60}m","streak_days":streak,"xp":xp}
-
-@router.get("/learning/summary")
-def learning_summary(user=Depends(current_user)):
-    db=get_db(); uid_=uid(user); raw=list(db.courses.find({"is_published":True},{"name":1,"title":1,"short_description":1,"description":1,"level":1,"category":1,"exam":1,"is_free":1,"thumbnail":1,"featured":1,"created_at":1}).sort([("featured",-1),("created_at",-1)]).limit(100)); ids=[str(x.get("_id")) for x in raw]; lc=_course_count_map(db,"lessons",{"course_id":{"$in":ids},"is_published":True}) if ids else {}; pc=_course_count_map(db,"progress",{"user_id":uid_,"course_id":{"$in":ids},"completed":True}) if ids else {}; courses=[]
-    for c in raw:
-        x=clean(c); cid=str(c.get("_id")); total=lc.get(cid,0); done=pc.get(cid,0); x.update({"lesson_count":total,"progress_percentage":round(done*100/total,2) if total else 0}); courses.append(x)
-    progress=[clean(x) for x in db.progress.find({"user_id":uid_},{"course_id":1,"lesson_id":1,"completed":1,"completed_at":1,"updated_at":1}).sort("updated_at",-1).limit(500)]; results=_enrich_quiz_results(list(db.test_attempts.find({"user_id":uid_,"status":"submitted"}).sort("submitted_at",-1).limit(100)),db); return {"courses":courses,"progress":progress,"results":results,"plan":_learning_plan(db,user)}
+def home(user=Depends(current_user)):
+    """Single network call for the student home screen. Each component is TTL-cached."""
+    user_id = uid(user)
+    key = f"home:{user_id}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    result = {
+        "dashboard": dashboard(user),
+        "catalog": catalog_categories(user),
+        "featured": catalog_featured(10, user),
+        "quizzes": quizzes(user=user),
+    }
+    cache.set(key, result, TTL_DASHBOARD)
+    return result
 
 @router.get("/profile")
 def profile(user=Depends(current_user)):
     return {"id": uid(user), "name": user.get("name",""), "email": user.get("email",""), "role": user.get("role","student"), "is_active": user.get("is_active",True)}
 
 @router.get("/courses")
-def courses(search:str|None=None,category:str|None=None,exam:str|None=None,level:str|None=None,language:str|None=None,free_only:bool=False,page:int=Query(1,ge=1),limit:int=Query(20,ge=1,le=50),user=Depends(current_user)):
-    db=get_db(); uid_=uid(user); q={"is_published":True}
+def courses(search: str | None = None, category: str | None = None, exam: str | None = None, level: str | None = None, language: str | None = None, free_only: bool = True, user=Depends(current_user)):
+    db = get_db(); user_id = uid(user)
+    key = f"courses:{user_id}:{search or ''}:{category or ''}:{exam or ''}:{level or ''}:{language or ''}:{free_only}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    q = {"is_published": True}
     if search:
-        z=re.escape(search.strip()); q["$or"]=[{"name":{"$regex":z,"$options":"i"}},{"title":{"$regex":z,"$options":"i"}},{"description":{"$regex":z,"$options":"i"}},{"exam":{"$regex":z,"$options":"i"}},{"tags":{"$regex":z,"$options":"i"}}]
-    if category:q["category"]=category
-    if exam:q["exam"]=exam
-    if level:q["level"]=level
-    if language:q["language"]=language
-    if free_only:q["is_free"]=True
-    raw=list(db.courses.find(q,{"name":1,"title":1,"short_description":1,"description":1,"level":1,"category":1,"exam":1,"language":1,"is_free":1,"thumbnail":1,"featured":1,"created_at":1,"video_count":1,"mock_test_count":1,"pdf_count":1}).sort([("featured",-1),("created_at",-1)]).skip((page-1)*limit).limit(limit)); ids=[str(x.get("_id")) for x in raw]; enrolled={str(x.get("course_id")) for x in db.enrollments.find({"user_id":uid_},{"course_id":1})}; lc=_course_count_map(db,"lessons",{"course_id":{"$in":ids},"is_published":True}) if ids else {}; qc=_course_count_map(db,"quizzes",{"course_id":{"$in":ids},"is_published":True}) if ids else {}; rc=_course_count_map(db,"course_resources",{"course_id":{"$in":ids}}) if ids else {}; pc=_course_count_map(db,"progress",{"user_id":uid_,"course_id":{"$in":ids},"completed":True}) if ids else {}; items=[]
-    for c in raw:
-        cid=str(c.get("_id")); total=lc.get(cid,0); done=pc.get(cid,0); item=clean(c); item.update({"is_enrolled":cid in enrolled,"lesson_count":total,"quiz_count":qc.get(cid,0),"pdf_count":rc.get(cid,0),"progress_percentage":round(done*100/total,2) if total else 0}); items.append(item)
-    return {"items":items,"page":page,"limit":limit,"has_more":len(raw)==limit}
+        q["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"title": {"$regex": search, "$options": "i"}},
+            {"description": {"$regex": search, "$options": "i"}},
+            {"exam": {"$regex": search, "$options": "i"}},
+            {"tags": {"$regex": search, "$options": "i"}},
+        ]
+    if category: q["category"] = {"$regex": category, "$options": "i"}
+    if exam: q["exam"] = {"$regex": exam, "$options": "i"}
+    if level: q["level"] = {"$regex": level, "$options": "i"}
+    if language: q["language"] = {"$regex": language, "$options": "i"}
+
+    enrolled_ids = {str(x.get("course_id")) for x in db.enrollments.find({"user_id": user_id}, {"course_id": 1})}
+    progress_docs = list(db.progress.find({"user_id": user_id}, {"course_id": 1, "lesson_id": 1, "completed": 1}))
+    completed_by_course = {}
+    for x in progress_docs:
+        if x.get("completed"):
+            completed_by_course[str(x.get("course_id"))] = completed_by_course.get(str(x.get("course_id")), 0) + 1
+
+    courses_list = list(db.courses.find(q).sort([("featured", -1), ("created_at", -1)]))
+    ids = [str(x.get("_id")) for x in courses_list]
+    lesson_counts = {str(x["_id"]): x["n"] for x in db.lessons.aggregate([
+        {"$match": {"course_id": {"$in": ids}, "is_published": True}},
+        {"$group": {"_id": "$course_id", "n": {"$sum": 1}}}
+    ])} if ids else {}
+    quiz_counts = {str(x["_id"]): x["n"] for x in db.quizzes.aggregate([
+        {"$match": {"course_id": {"$in": ids}, "is_published": True}},
+        {"$group": {"_id": "$course_id", "n": {"$sum": 1}}}
+    ])} if ids else {}
+    resource_counts = {str(x["_id"]): x["n"] for x in db.course_resources.aggregate([
+        {"$match": {"course_id": {"$in": ids}}},
+        {"$group": {"_id": "$course_id", "n": {"$sum": 1}}}
+    ])} if ids else {}
+
+    items = []
+    for course in courses_list:
+        cid = str(course.get("_id")); total = lesson_counts.get(cid, 0); completed = completed_by_course.get(cid, 0)
+        item = clean(course)
+        item.update({
+            "is_enrolled": cid in enrolled_ids,
+            "lesson_count": total,
+            "quiz_count": quiz_counts.get(cid, 0),
+            "pdf_count": resource_counts.get(cid, 0),
+            "progress_percentage": round(completed * 100 / total, 2) if total else 0,
+        })
+        items.append(item)
+    cache.set(key, items, TTL_COURSES)
+    return items
+
+@router.get("/catalog/categories")
+def catalog_categories(user=Depends(current_user)):
+    key = "catalog:categories"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    db = get_db()
+    result = {
+        "categories": sorted(x for x in db.courses.distinct("category") if x),
+        "exams": sorted(x for x in db.courses.distinct("exam") if x),
+        "levels": sorted(x for x in db.courses.distinct("level") if x),
+    }
+    cache.set(key, result, TTL_CATEGORIES)
+    return result
+
+@router.get("/catalog/featured")
+def catalog_featured(limit:int=Query(8,ge=1,le=30),user=Depends(current_user)):
+    key = f"catalog:featured:{limit}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    db=get_db()
+    result = {
+        "courses": [clean(x) for x in db.courses.find({"is_published":True}).sort([("featured",-1),("created_at",-1)]).limit(limit)],
+        "quizzes": [clean(x) for x in db.quizzes.find({"is_published":True}).sort([("featured",-1),("created_at",-1)]).limit(limit)],
+    }
+    cache.set(key, result, TTL_FEATURED)
+    return result
 
 @router.get("/courses/{course_id}/overview")
 def course_overview(course_id:str,user=Depends(current_user)):
-    db=get_db(); c=published("courses",course_id); user_id=uid(user); modules=[clean(x) for x in db.topics.find({"course_id":course_id,"is_published":True}).sort("order",1)]; tids=[str(x.get("_id")) for x in modules]; raw=list(db.lessons.find({"course_id":course_id,"topic_id":{"$in":tids},"is_published":True},{"title":1,"name":1,"description":1,"topic_id":1,"order":1,"duration_minutes":1,"content":1}).sort([("topic_id",1),("order",1)])); lids=[str(x.get("_id")) for x in raw]; rr=list(db.lesson_resources.find({"lesson_id":{"$in":lids}},{"lesson_id":1,"title":1,"url":1,"type":1,"order":1,"duration_seconds":1}).sort("order",1)) if lids else []; rb={}
-    for x in rr: rb.setdefault(str(x.get("lesson_id")),[]).append(clean(x))
-    names={str(x.get("_id")):(x.get("title") or x.get("name") or "Topic") for x in modules}; done_rows=list(db.progress.find({"user_id":user_id,"course_id":course_id,"completed":True},{"lesson_id":1})); done_ids={str(x.get("lesson_id")) for x in done_rows}; lessons=[]
-    for x in raw:
-        item=clean(x); item["topic_title"]=names.get(str(x.get("topic_id")),"Topic"); item["resources"]=rb.get(str(x.get("_id")),[]); item["completed"]=str(x.get("_id")) in done_ids; lessons.append(item)
-    co=clean(c); co["resources"]=[clean(x) for x in db.course_resources.find({"course_id":course_id},{"title":1,"url":1,"type":1,"order":1}).sort("order",1)]; quizzes=[clean(x) for x in db.quizzes.find({"course_id":course_id,"is_published":True},{"title":1,"name":1,"duration_minutes":1,"question_ids":1,"passing_percentage":1,"created_at":1}).sort("created_at",-1)]; reviews=[clean(x) for x in db.course_reviews.find({"course_id":course_id},{"user_id":1,"user_name":1,"rating":1,"review":1,"created_at":1}).sort("created_at",-1).limit(50)]; bookmarked=bool(db.bookmarks.find_one({"user_id":user_id,"item_type":"course","item_id":course_id},{"_id":1})); total=len(lessons); done=len(done_ids); return {"course":co,"modules":modules,"lessons":lessons,"quizzes":quizzes,"reviews":reviews,"bookmarked":bookmarked,"progress":{"course_id":course_id,"total_lessons":total,"completed_lessons":done,"percentage":round(done*100/total,2) if total else 0}}
-
-@router.get("/courses/{course_id}")
-def course(course_id: str, user=Depends(current_user)):
-    c = published("courses", course_id)
-    out = clean(c)
-    out["resources"] = clean(list(get_db().course_resources.find({"course_id":course_id}).sort("order",1)))
-    return out
-
-@router.get("/courses/{course_id}/modules")
-def course_modules(course_id: str, user=Depends(current_user)):
-    published("courses", course_id)
-    return [clean(x) for x in get_db().topics.find({"course_id":course_id,"is_published":True}).sort("order",1)]
-
-@router.get("/modules/{module_id}")
-def module(module_id: str, user=Depends(current_user)):
-    return clean(published("topics", module_id))
-
-@router.get("/modules/{module_id}/lessons")
-def module_lessons(module_id: str, user=Depends(current_user)):
-    published("topics", module_id)
-    return [clean(x) for x in get_db().lessons.find({"topic_id":module_id,"is_published":True}).sort("order",1)]
-
-@router.get("/lessons")
-def lessons(course_id: str | None=None, module_id: str | None=None, user=Depends(current_user)):
-    q={"is_published":True}
-    if course_id: q["course_id"]=course_id
-    if module_id: q["topic_id"]=module_id
-    return [clean(x) for x in get_db().lessons.find(q).sort("order",1)]
-
-@router.get("/lessons/{lesson_id}")
-def lesson(lesson_id: str, user=Depends(current_user)):
-    l = published("lessons", lesson_id)
-    db = get_db()
-    out = clean(l)
-    topic = find_by_id("topics", str(l.get("topic_id", ""))) if l.get("topic_id") else None
-    out["topic_title"] = (topic.get("title") or topic.get("name")) if topic else "Topic"
-    out["resources"] = clean(list(db.lesson_resources.find({"lesson_id":lesson_id}).sort("order",1)))
-    return out
-
-@router.post("/courses/{course_id}/enroll")
-def enroll(course_id: str, user=Depends(current_user)):
-    published("courses", course_id)
-    db=get_db(); user_id=uid(user)
-    existing=db.enrollments.find_one({"user_id":user_id,"course_id":course_id})
-    if existing: return clean(existing)
-    d={"_id":uuid.uuid4().hex,"user_id":user_id,"course_id":course_id,"status":"active","created_at":datetime.now(timezone.utc),"updated_at":datetime.now(timezone.utc)}
-    db.enrollments.insert_one(d)
-    db.courses.update_one({"_id": c_id}, {"$inc": {"students_count": 1}}) if (c_id := course_id) else None
-    db.notifications.insert_one({"_id": uuid.uuid4().hex, "user_id": user_id, "title": "Course enrolled", "message": f"You enrolled in {course_id}.", "read": False, "created_at": datetime.now(timezone.utc)})
-    return clean(d)
+    key = f"course:overview:{course_id}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    c=published("courses",course_id); db=get_db()
+    modules=[clean(x) for x in db.topics.find({"course_id":course_id,"is_published":True}).sort("order",1)]
+    topic_ids=[str(x.get("_id")) for x in modules]
+    lessons=[clean(x) for x in db.lessons.find({"course_id":course_id,"topic_id":{"$in":topic_ids},"is_published":True}).sort([("topic_id",1),("order",1)])]
+    quizzes=[clean(x) for x in db.quizzes.find({"course_id":course_id,"is_published":True}).sort("created_at",-1)]
+    topic_names={str(x.get("_id")):(x.get("title") or x.get("name") or "Topic") for x in modules}
+    lesson_ids=[str(x.get("_id")) for x in lessons]
+    resources_by_lesson={}
+    if lesson_ids:
+        for r in db.lesson_resources.find({"lesson_id":{"$in":lesson_ids}}).sort("order",1):
+            resources_by_lesson.setdefault(str(r.get("lesson_id")), []).append(clean(r))
+    for lesson in lessons:
+        lesson["topic_title"]=topic_names.get(str(lesson.get("topic_id")),"Topic")
+        lesson["resources"]=resources_by_lesson.get(str(lesson.get("_id")),[])
+    course_out=clean(c)
+    course_out["resources"]=clean(list(db.course_resources.find({"course_id":course_id}).sort("order",1)))
+    result={"course":course_out,"modules":modules,"lessons":lessons,"quizzes":quizzes}
+    cache.set(key,result,TTL_COURSE_OVERVIEW)
+    return result
 
 @router.get("/enrollments")
 def enrollments(user=Depends(current_user)):
-    return [clean(x) for x in get_db().enrollments.find({"user_id":uid(user)}).sort("created_at",-1)]
+    user_id = uid(user); key = f"enrollments:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    result = [clean(x) for x in get_db().enrollments.find({"user_id":user_id}).sort("created_at",-1)]
+    cache.set(key, result, TTL_ENROLLMENTS)
+    return result
 
 @router.get("/progress")
 def progress(user=Depends(current_user)):
-    return [clean(x) for x in get_db().progress.find({"user_id":uid(user)}).sort("updated_at",-1)]
+    user_id = uid(user); key = f"progress:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    result = [clean(x) for x in get_db().progress.find({"user_id":user_id}).sort("updated_at",-1)]
+    cache.set(key, result, TTL_PROGRESS)
+    return result
 
 @router.get("/courses/{course_id}/progress")
-def course_progress(course_id:str,user=Depends(current_user)):
-    published("courses",course_id); db=get_db(); user_id=uid(user); total=db.lessons.count_documents({"course_id":course_id,"is_published":True}); done=db.progress.count_documents({"user_id":user_id,"course_id":course_id,"completed":True}); return {"course_id":course_id,"total_lessons":total,"completed_lessons":done,"percentage":round(done*100/total,2) if total else 0}
+def course_progress(course_id: str, user=Depends(current_user)):
+    published("courses",course_id); db=get_db(); user_id=uid(user)
+    topic_ids=[str(x.get("_id")) for x in db.topics.find({"course_id":course_id,"is_published":True},{"_id":1})]
+    total=db.lessons.count_documents({"course_id":course_id,"topic_id":{"$in":topic_ids},"is_published":True})
+    done=db.progress.count_documents({"user_id":user_id,"course_id":course_id,"completed":True,"lesson_id":{"$in":[str(x.get("_id")) for x in db.lessons.find({"course_id":course_id,"topic_id":{"$in":topic_ids},"is_published":True},{"_id":1})]}})
+    return {"course_id":course_id,"total_lessons":total,"completed_lessons":done,"percentage":round(done*100/total,2) if total else 0}
 
 @router.post("/progress")
 def save_progress(data: dict, user=Depends(current_user)):
     course_id=data.get("course_id"); lesson_id=data.get("lesson_id")
     if not course_id or not lesson_id: raise HTTPException(422,"course_id and lesson_id are required")
     d=dict(data); d.update({"_id":uuid.uuid4().hex,"user_id":uid(user),"updated_at":datetime.now(timezone.utc)})
-    get_db().progress.update_one({"user_id":uid(user),"lesson_id":lesson_id},{"$set":d},upsert=True)
-    return clean(get_db().progress.find_one({"user_id":uid(user),"lesson_id":lesson_id}))
+    db = get_db()
+    db.progress.update_one({"user_id":uid(user),"lesson_id":lesson_id},{"$set":d},upsert=True)
+    cache.delete_prefix(f"dashboard:{uid(user)}")
+    cache.delete_prefix(f"home:{uid(user)}")
+    cache.delete_prefix(f"courses:{uid(user)}:")
+    cache.delete_prefix(f"personalized:{uid(user)}")
+    cache.delete_prefix(f"progress:{uid(user)}")
+    cache.delete_prefix(f"results:{uid(user)}")
+    return clean(db.progress.find_one({"user_id":uid(user),"lesson_id":lesson_id}))
 
 @router.post("/lessons/{lesson_id}/complete")
 def complete_lesson(lesson_id: str, user=Depends(current_user)):
@@ -252,25 +373,34 @@ def complete_lesson(lesson_id: str, user=Depends(current_user)):
     d={"_id":uuid.uuid4().hex,"user_id":uid(user),"course_id":l.get("course_id"),"lesson_id":lesson_id,"completed":True,"completed_at":datetime.now(timezone.utc),"updated_at":datetime.now(timezone.utc)}
     db.progress.update_one({"user_id":uid(user),"lesson_id":lesson_id},{"$set":d},upsert=True)
     db.notifications.insert_one({"_id": uuid.uuid4().hex, "user_id": uid(user), "title": "Lesson completed", "message": "Great job! You completed a lesson.", "read": False, "created_at": datetime.now(timezone.utc)})
+    cache.delete_prefix(f"dashboard:{uid(user)}")
+    cache.delete_prefix(f"home:{uid(user)}")
+    cache.delete_prefix(f"courses:{uid(user)}:")
+    cache.delete_prefix(f"personalized:{uid(user)}")
+    cache.delete_prefix(f"progress:{uid(user)}")
+    cache.delete_prefix(f"analytics:{uid(user)}")
+    cache.delete_prefix(f"badges:{uid(user)}")
     return clean(d)
 
 # Quiz discovery and attempt
 @router.get("/quizzes")
 def quizzes(course_id: str|None=None, module_id: str|None=None, user=Depends(current_user)):
+    db=get_db()
+    key=f"quizzes:{course_id or ''}:{module_id or ''}"
+    cached=cache.get(key)
+    if cached is not None:
+        return cached
     q={"is_published":True}
     if course_id: q["course_id"]=course_id
     if module_id: q["module_id"]=module_id
     items=[]
-    db=get_db()
     for x in db.quizzes.find(q).sort("created_at",-1):
-        # Quiz publication is controlled by the quiz itself. This keeps the
-        # student Quizzes page usable for bulk-created/legacy quizzes whose
-        # parent course was created as draft before the quiz was published.
         item=clean(x)
         ids=list(x.get("question_ids",[]) or [])
         item["question_count"]=len(ids)
-        item["is_ready"]=len(ids)>0
+        item["is_ready"]=bool(ids)
         items.append(item)
+    cache.set(key,items,TTL_QUIZZES)
     return items
 
 @router.get("/quizzes/{quiz_id}")
@@ -278,10 +408,18 @@ def quiz(quiz_id: str, user=Depends(current_user)):
     return clean(published("quizzes",quiz_id))
 
 @router.get("/quizzes/{quiz_id}/questions")
-def quiz_questions(quiz_id:str,user=Depends(current_user)):
-    qz=published("quizzes",quiz_id); ids=[str(x) for x in qz.get("question_ids",[])];
-    if not ids:return []
-    docs=list(get_db().questions.find({"_id":{"$in":ids}})); by={str(x.get("_id")):x for x in docs}; return [clean(by[i],hide_answers=True) for i in ids if i in by]
+def quiz_questions(quiz_id: str, user=Depends(current_user)):
+    qz=published("quizzes",quiz_id)
+    ids=[str(x) for x in qz.get("question_ids",[])]
+    # The quiz itself is the publication boundary.  Bulk-imported questions
+    # may still be draft records until the admin publishes the quiz. Once the
+    # quiz is published, return its attached questions in quiz order while
+    # still hiding the answer/explanation from the student.
+    if not ids:
+        return []
+    found = list(get_db().questions.find({"_id": {"$in": ids}}))
+    by = {str(x["_id"]): x for x in found}
+    return [clean(by[i], hide_answers=True) for i in ids if i in by]
 
 @router.post("/quizzes/{quiz_id}/start")
 def start_quiz(quiz_id: str, user=Depends(current_user)):
@@ -341,23 +479,46 @@ def submit_quiz(quiz_id: str, data: dict, user=Depends(current_user)):
     db.test_attempts.update_one(query,{"$set":{"user_id":user_id,"test_id":quiz_id,"status":"submitted","result":result,"submitted_at":datetime.now(timezone.utc)}},upsert=False)
     return result
 
-def _enrich_quiz_results(rows,db):
-    items=[clean(x) for x in rows]; ids={str(x.get("test_id") or x.get("quiz_id") or "") for x in items}; ids.discard(""); qs=list(db.quizzes.find({"_id":{"$in":list(ids)}},{"title":1,"name":1,"course_id":1,"category":1})) if ids else []; by={str(x.get("_id")):x for x in qs}
-    for item in items:
-        q=by.get(str(item.get("test_id") or item.get("quiz_id") or ""));
-        if q: item.update({"quiz_title":q.get("title") or q.get("name") or "Quiz","course_id":q.get("course_id"),"category":q.get("category")})
-        r=item.get("result") or {}
-        if isinstance(r,dict): item.setdefault("percentage",r.get("percentage",0)); item.setdefault("correct_count",r.get("correct_count",0)); item.setdefault("wrong_count",r.get("wrong_count",0)); item.setdefault("passed",r.get("passed",False)); item.setdefault("details",r.get("details",[]))
-    return items
+def _enrich_quiz_result(row, db):
+    item=clean(row)
+    quiz_id=str(item.get("test_id") or item.get("quiz_id") or "")
+    qz=db.quizzes.find_one({"_id":quiz_id})
+    if not qz:
+        try:
+            from bson import ObjectId
+            if ObjectId.is_valid(quiz_id):
+                qz=db.quizzes.find_one({"_id":ObjectId(quiz_id)})
+        except Exception:
+            pass
+    if qz:
+        item["quiz_title"]=qz.get("title") or qz.get("name") or "Quiz"
+        item["course_id"]=qz.get("course_id")
+        item["category"]=qz.get("category")
+    result=item.get("result") or {}
+    if isinstance(result,dict):
+        item.setdefault("percentage",result.get("percentage",0))
+        item.setdefault("correct_count",result.get("correct_count",0))
+        item.setdefault("wrong_count",result.get("wrong_count",0))
+        item.setdefault("passed",result.get("passed",False))
+        item.setdefault("details",result.get("details",[]))
+    return item
 
 @router.get("/quizzes/{quiz_id}/results")
-def quiz_results(quiz_id:str,user=Depends(current_user)):
-    db=get_db(); return _enrich_quiz_results(list(db.test_attempts.find({"user_id":uid(user),"test_id":quiz_id,"status":"submitted"}).sort("submitted_at",-1).limit(50)),db)
+def quiz_results(quiz_id: str,user=Depends(current_user)):
+    db=get_db()
+    return [_enrich_quiz_result(x,db) for x in db.test_attempts.find({"user_id":uid(user),"test_id":quiz_id,"status":"submitted"}).sort("submitted_at",-1)]
 
 @router.get("/results")
 def results(user=Depends(current_user)):
-    db=get_db(); return _enrich_quiz_results(list(db.test_attempts.find({"user_id":uid(user),"status":"submitted"}).sort("submitted_at",-1).limit(100)),db)
+    user_id = uid(user); key = f"results:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    db=get_db()
+    result = [_enrich_quiz_result(x,db) for x in db.test_attempts.find({"user_id":user_id,"status":"submitted"}).sort("submitted_at",-1)]
+    cache.set(key, result, TTL_RESULTS)
+    return result
 
+# Questions discovery for learning (not answers)
 @router.get("/questions")
 def questions(course_id: str|None=None,module_id: str|None=None,topic_id: str|None=None,difficulty: str|None=None,limit:int=Query(100,ge=1,le=500)):
     q={"is_published":True}
@@ -369,23 +530,28 @@ def questions(course_id: str|None=None,module_id: str|None=None,topic_id: str|No
 # Notes
 @router.get("/notes")
 def notes(user=Depends(current_user)):
-    return [clean(x) for x in get_db().notes.find({"user_id":uid(user)}).sort("created_at",-1)]
+    user_id = uid(user); key = f"notes:{user_id}"
+    cached = cache.get(key)
+    if cached is not None: return cached
+    result = [clean(x) for x in get_db().notes.find({"user_id":user_id}).sort("created_at",-1)]
+    cache.set(key, result, TTL_NOTES)
+    return result
 
 @router.post("/notes")
 def add_note(data:dict,user=Depends(current_user)):
     if not data.get("content"): raise HTTPException(422,"Note content is required")
     d={"_id":uuid.uuid4().hex,"user_id":uid(user),"content":data["content"],"lesson_id":data.get("lesson_id"),"course_id":data.get("course_id"),"created_at":datetime.now(timezone.utc),"updated_at":datetime.now(timezone.utc)}
-    get_db().notes.insert_one(d); return clean(d)
+    get_db().notes.insert_one(d); cache.delete_prefix(f"notes:{uid(user)}"); return clean(d)
 
 @router.put("/notes/{note_id}")
 def update_note(note_id:str,data:dict,user=Depends(current_user)):
     x=find_by_id("notes",note_id)
     if not x or x.get("user_id")!=uid(user): raise HTTPException(404,"Note not found")
     d=dict(data); d.pop("_id",None); d["updated_at"]=datetime.now(timezone.utc)
-    get_db().notes.update_one({"_id":x["_id"]},{"$set":d}); return clean(get_db().notes.find_one({"_id":x["_id"]}))
+    get_db().notes.update_one({"_id":x["_id"]},{"$set":d}); cache.delete_prefix(f"notes:{uid(user)}"); return clean(get_db().notes.find_one({"_id":x["_id"]}))
 
 @router.delete("/notes/{note_id}")
 def delete_note(note_id:str,user=Depends(current_user)):
     x=find_by_id("notes",note_id)
     if not x or x.get("user_id")!=uid(user): raise HTTPException(404,"Note not found")
-    get_db().notes.delete_one({"_id":x["_id"]}); return {"message":"Note deleted"}
+    get_db().notes.delete_one({"_id":x["_id"]}); cache.delete_prefix(f"notes:{uid(user)}"); return {"message":"Note deleted"}
