@@ -13,12 +13,16 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from: str = ""
     smtp_use_tls: bool = True
-
-    # Brevo transactional email API (HTTPS, works on Render Free)
     brevo_api_key: str = ""
+    brevo_api_url: str = "https://api.brevo.com/v3/smtp/email"
     brevo_sender_email: str = ""
     brevo_sender_name: str = "Smart Learning Lab"
-    brevo_api_url: str = "https://api.brevo.com/v3/smtp/email"
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name: str = ""
+    r2_endpoint_url: str = ""
+    r2_signed_url_expiry: int = 900
     password_reset_minutes: int = 30
     email_verification_hours: int = 24
     backend_public_url: str = "http://127.0.0.1:8000"

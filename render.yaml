@@ -14,23 +14,25 @@ services:
       - key: JWT_EXPIRE_MINUTES
         value: "1440"
       - key: CORS_ORIGINS
-        value: "https://smartlearninglab-react.onrender.com"
-      - key: BREVO_API_KEY
+        value: "*"
+      - key: SMTP_HOST
         sync: false
-      - key: BREVO_SENDER_EMAIL
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
         sync: false
-      - key: BREVO_SENDER_NAME
-        value: "Smart Learning Lab"
-      - key: BREVO_API_URL
-        value: "https://api.brevo.com/v3/smtp/email"
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: SMTP_USE_TLS
+        value: "true"
       - key: PASSWORD_RESET_MINUTES
         value: "30"
-      - key: EMAIL_VERIFICATION_HOURS
-        value: "24"
       - key: FRONTEND_WEB_URL
-        value: "https://smartlearninglab-react.onrender.com"
+        sync: false
       - key: BACKEND_PUBLIC_URL
-        value: "https://smartlearninglab.onrender.com"
+        sync: false
       - key: FRONTEND_MOBILE_SCHEME
         value: "smartlearninglab://"
       - key: GOOGLE_CLIENT_ID

@@ -164,8 +164,9 @@ def send_email(to_email: str, subject: str, body: str):
     s = get_settings()
     masked_to = mask_email(to_email)
 
-    if s.brevo_api_key:
-        sender_email = (s.brevo_sender_email or s.smtp_from or s.smtp_username).strip()
+    brevo_key = (s.brevo_api_key or "").strip()
+    if brevo_key:
+        sender_email = (s.brevo_sender_email or "").strip()
         sender_name = (s.brevo_sender_name or "Smart Learning Lab").strip()
         if not sender_email:
             logger.error("BREVO_CONFIG_ERROR | sender_email_set=false")
@@ -179,7 +180,7 @@ def send_email(to_email: str, subject: str, body: str):
         }
         headers = {
             "accept": "application/json",
-            "api-key": s.brevo_api_key,
+            "api-key": brevo_key,
             "content-type": "application/json",
         }
 
@@ -215,7 +216,7 @@ def send_email(to_email: str, subject: str, body: str):
                 detail,
             )
             raise RuntimeError(
-                f"Brevo rejected the email request (HTTP {response.status_code})."
+                f"Brevo rejected the email request (HTTP {response.status_code}): {detail}"
             )
 
         message_id = ""

@@ -3,8 +3,7 @@ import io, uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from app.core.security import admin_user
 from app.db.mongo import get_db
-from app.api.media import COURSE_CATEGORIES
-from gridfs import GridFSBucket
+from app.api.media import COURSE_CATEGORIES, upload_bytes
 from app.services.pdf_course_importer import build_course_from_pdf
 
 router = APIRouter(prefix="/api/v1/admin/bulk", tags=["Admin Bulk Content"])
@@ -167,14 +166,17 @@ async def bulk_course_pdf(file:UploadFile=File(...),title:str=Form(""),category:
     if not modules or not any(m.get("lessons") for m in modules):
         raise HTTPException(422,"No usable lesson content was found in this PDF. Upload the complete educational PDF.")
 
-    db=get_db(); bucket=GridFSBucket(db,bucket_name="sll_media")
-    media_id=bucket.upload_from_stream(file.filename,io.BytesIO(raw),metadata={"content_type":"application/pdf","resource_type":"pdf","owner_type":"course_source_pdf","uploaded_by":uid(user),"source":"bulk_course_pdf_v2","uploaded_at":now()})
+    db=get_db()
+    try:
+        media_id, media_filename, media_content_type, media_kind, storage_key = upload_bytes(raw, file.filename, "application/pdf", {"type":"pdf","owner_type":"course_source_pdf","course_id":"pending"})
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
     source_pdf_url=f"/api/v1/media/{media_id}"
     course_id=uuid.uuid4().hex
     course_title=(title or generated.get("title") or file.filename).strip()
-    course={"_id":course_id,"name":course_title,"title":course_title,"description":f"Course generated from {file.filename}. The PDF structure is used as the source of truth; no lesson content is invented.","short_description":f"Imported from {file.filename}"[:180],"category":category,"subcategory":"","level":level,"language":language,"is_free":True,"featured":False,"is_published":False,"learning_objectives":[],"prerequisites":[],"estimated_minutes":0,"instructor_name":"Smart Learning Lab","exam":"General","tags":[category.lower()],"rating":0,"students_count":0,"video_count":0,"pdf_count":1,"mock_test_count":0,"source_pdf_name":file.filename,"source_pdf_size":len(raw),"source_pdf_media_id":str(media_id),"source_pdf_url":source_pdf_url,"source_pdf_page_count":generated.get("page_count",0),"pdf_import_strategy":generated.get("strategy"),"pdf_import_report":{"toc_pages":generated.get("toc_pages",[]),"source_topic_count":generated.get("source_topic_count",0),"missing_topics":generated.get("missing_topics",0),"lessons_with_content":generated.get("lessons_with_content",0)},"bulk_imported":True,"created_at":now(),"updated_at":now(),"created_by":uid(user)}
+    course={"_id":course_id,"name":course_title,"title":course_title,"description":f"Course generated from {file.filename}. The PDF structure is used as the source of truth; no lesson content is invented.","short_description":f"Imported from {file.filename}"[:180],"category":category,"subcategory":"","level":level,"language":language,"is_free":True,"featured":False,"is_published":False,"learning_objectives":[],"prerequisites":[],"estimated_minutes":0,"instructor_name":"Smart Learning Lab","exam":"General","tags":[category.lower()],"rating":0,"students_count":0,"video_count":0,"pdf_count":1,"mock_test_count":0,"source_pdf_name":file.filename,"source_pdf_size":len(raw),"source_pdf_media_id":str(media_id),"source_pdf_storage_key":storage_key,"source_pdf_url":source_pdf_url,"source_pdf_page_count":generated.get("page_count",0),"pdf_import_strategy":generated.get("strategy"),"pdf_import_report":{"toc_pages":generated.get("toc_pages",[]),"source_topic_count":generated.get("source_topic_count",0),"missing_topics":generated.get("missing_topics",0),"lessons_with_content":generated.get("lessons_with_content",0)},"bulk_imported":True,"created_at":now(),"updated_at":now(),"created_by":uid(user)}
     db.courses.insert_one(course)
-    db.course_resources.insert_one({"_id":uuid.uuid4().hex,"course_id":course_id,"title":file.filename,"description":"Original PDF used to generate this course.","url":source_pdf_url,"media_id":str(media_id),"filename":file.filename,"content_type":"application/pdf","type":"pdf","source":"bulk_course_pdf_v2","order":1,"created_at":now(),"created_by":uid(user)})
+    db.course_resources.insert_one({"_id":uuid.uuid4().hex,"course_id":course_id,"title":file.filename,"description":"Original PDF used to generate this course.","url":source_pdf_url,"media_id":str(media_id),"storage":"r2","storage_key":storage_key,"filename":file.filename,"content_type":"application/pdf","type":"pdf","source":"bulk_course_pdf_v2","order":1,"created_at":now(),"created_by":uid(user)})
 
     module_count=lesson_count=0
     for mi,module in enumerate(modules,1):
