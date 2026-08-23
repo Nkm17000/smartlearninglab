@@ -125,7 +125,9 @@ def forgot_password(data: ForgotPasswordRequest):
     db = get_db()
     user = db.users.find_one({"email": data.email.lower()})
     # Always return the same response to avoid email enumeration.
+    print("calling apis")
     response = {"message": "If the email exists, a password reset link has been sent."}
+    print(user)
     if not user or not user.get("is_active", True):
         return response
 

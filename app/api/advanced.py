@@ -1,5 +1,5 @@
 from datetime import datetime, timezone, timedelta
-import re, uuid
+import re, uuid, hashlib
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from app.core.security import current_user, admin_user
 from app.db.mongo import get_db
@@ -387,15 +387,16 @@ def remove_device(token:str,user=Depends(current_user)):
 @router.post('/auth/verify-email/request')
 def request_verify(user=Depends(current_user)):
     raw=uuid.uuid4().hex+uuid.uuid4().hex
-    get_db().email_verification_tokens.update_one({'user_id':uid(user)},{'$set':{'token':raw,'expires_at':now()+timedelta(hours=24),'created_at':now()}},upsert=True)
-    # In production, send raw token by SMTP. Return only in development when explicitly enabled.
-    return {'message':'Verification email requested','development_token':raw}
+    token_hash=hashlib.sha256(raw.encode('utf-8')).hexdigest()
+    get_db().email_verification_tokens.update_one({'user_id':uid(user)},{'$set':{'token_hash':token_hash,'expires_at':now()+timedelta(hours=24),'created_at':now()}},upsert=True)
+    return {'message':'Verification email requested'}
 
 @router.post('/auth/verify-email')
 def verify_email(data:dict,user=Depends(current_user)):
-    row=get_db().email_verification_tokens.find_one({'user_id':uid(user),'token':data.get('token')})
+    raw=str(data.get('token',''))
+    row=get_db().email_verification_tokens.find_one({'user_id':uid(user),'token_hash':hashlib.sha256(raw.encode('utf-8')).hexdigest()})
     if not row or row.get('expires_at',now())<=now(): raise HTTPException(400,'Verification token invalid or expired')
-    get_db().users.update_one({'_id':user['_id']},{'$set':{'email_verified':True,'updated_at':now()}})
+    get_db().users.update_one({'_id':user['_id']},{'$set':{'email_verified':True,'is_active':True,'updated_at':now()}})
     get_db().email_verification_tokens.delete_one({'_id':row['_id']})
     return {'verified':True}
 

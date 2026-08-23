@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: smartlearninglab-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.13
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: JWT_EXPIRE_MINUTES
+        value: "1440"
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: SMTP_USE_TLS
+        value: "true"
+      - key: PASSWORD_RESET_MINUTES
+        value: "30"
+      - key: FRONTEND_WEB_URL
+        sync: false
+      - key: FRONTEND_MOBILE_SCHEME
+        value: "smartlearninglab://"
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_REDIRECT_URI
+        sync: false

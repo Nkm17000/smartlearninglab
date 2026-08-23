@@ -14,8 +14,14 @@ class Settings(BaseSettings):
     smtp_from: str = ""
     smtp_use_tls: bool = True
     password_reset_minutes: int = 30
+    email_verification_hours: int = 24
+    backend_public_url: str = "http://127.0.0.1:8000"
     frontend_web_url: str = "http://localhost:8081"
     frontend_mobile_scheme: str = "smartlearninglab://"
+
+    # API logging
+    log_level: str = "INFO"
+    log_dir: str = "logs"
 
     google_client_id: str = ""
     google_client_secret: str = ""
