@@ -154,10 +154,85 @@ def token_hash(token: str) -> str:
 
 
 def send_email(to_email: str, subject: str, body: str):
+    """Send transactional email through Brevo when configured.
+
+    Brevo uses HTTPS (port 443), so this works on Render Free where outbound
+    SMTP ports such as Gmail 587 are restricted. Local development can still
+    fall back to the existing SMTP implementation when BREVO_API_KEY is not set.
+    Registration confirmation and password-reset emails both use this function.
+    """
     s = get_settings()
     masked_to = mask_email(to_email)
-    masked_from = mask_email(s.smtp_from or s.smtp_username) if (s.smtp_from or s.smtp_username) else "<not-set>"
 
+    if s.brevo_api_key:
+        sender_email = (s.brevo_sender_email or s.smtp_from or s.smtp_username).strip()
+        sender_name = (s.brevo_sender_name or "Smart Learning Lab").strip()
+        if not sender_email:
+            logger.error("BREVO_CONFIG_ERROR | sender_email_set=false")
+            raise RuntimeError("Brevo sender email is not configured. Set BREVO_SENDER_EMAIL.")
+
+        payload = {
+            "sender": {"name": sender_name, "email": sender_email},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "textContent": body,
+        }
+        headers = {
+            "accept": "application/json",
+            "api-key": s.brevo_api_key,
+            "content-type": "application/json",
+        }
+
+        logger.info(
+            "BREVO_SEND_START | to=%s | from=%s | subject=%s",
+            masked_to,
+            mask_email(sender_email),
+            subject,
+        )
+        try:
+            response = requests.post(
+                s.brevo_api_url,
+                json=payload,
+                headers=headers,
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            logger.exception(
+                "BREVO_SEND_FAILED | to=%s | error_type=%s | error=%s",
+                masked_to,
+                type(exc).__name__,
+                str(exc),
+            )
+            raise RuntimeError("Unable to reach Brevo email service.") from exc
+
+        if not 200 <= response.status_code < 300:
+            # Brevo error bodies are useful in Render logs, but never log the API key.
+            detail = response.text[:1000]
+            logger.error(
+                "BREVO_SEND_FAILED | to=%s | status=%s | response=%s",
+                masked_to,
+                response.status_code,
+                detail,
+            )
+            raise RuntimeError(
+                f"Brevo rejected the email request (HTTP {response.status_code})."
+            )
+
+        message_id = ""
+        try:
+            message_id = str(response.json().get("messageId", ""))
+        except ValueError:
+            pass
+        logger.info(
+            "BREVO_SEND_SUCCESS | to=%s | subject=%s | message_id=%s",
+            masked_to,
+            subject,
+            message_id or "<none>",
+        )
+        return
+
+    # Local-development fallback: preserve the existing Gmail/SMTP mechanism.
+    masked_from = mask_email(s.smtp_from or s.smtp_username) if (s.smtp_from or s.smtp_username) else "<not-set>"
     logger.info(
         "SMTP_SEND_START | to=%s | from=%s | host=%s | port=%s | tls=%s | subject=%s",
         masked_to,
@@ -176,7 +251,10 @@ def send_email(to_email: str, subject: str, body: str):
             bool(s.smtp_password),
             bool(s.smtp_from),
         )
-        raise RuntimeError("SMTP is not configured. Set SMTP_HOST, SMTP_USERNAME and SMTP_PASSWORD.")
+        raise RuntimeError(
+            "Email provider is not configured. Set BREVO_API_KEY and BREVO_SENDER_EMAIL, "
+            "or configure SMTP for local development."
+        )
 
     msg = EmailMessage()
     msg["Subject"] = subject
