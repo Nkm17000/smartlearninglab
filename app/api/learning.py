@@ -5,7 +5,10 @@ from app.core.security import current_user
 from app.db.mongo import get_db
 from app.core.cache import (cache, TTL_DASHBOARD, TTL_COURSES, TTL_CATEGORIES,
                             TTL_FEATURED, TTL_COURSE_OVERVIEW, TTL_QUIZZES, TTL_RESULTS, TTL_PROGRESS, TTL_NOTES, TTL_ENROLLMENTS, TTL_LESSON_VIEW, TTL_LEARNING_SUMMARY, invalidate_user)
-from app.services.taxonomy import normalize_category_document, quiz_group_key
+from app.services.taxonomy import (
+    EXAM_CATEGORIES, SUBJECTS, normalize_category_document, normalize_categories,
+    normalize_subject, quiz_group_key,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["Student Learning"])
 
@@ -72,6 +75,106 @@ def published(collection, item_id):
     return x
 
 def uid(user): return str(user["_id"])
+
+
+def _catalog_values(db, field: str, fallback):
+    """Return canonical, sorted taxonomy values from published content.
+
+    Both the new array fields and the legacy scalar fields are supported so an
+    existing Mongo database can be upgraded gradually.
+    """
+    values = set()
+    try:
+        for value in db.courses.distinct(field, {"is_published": True}):
+            if isinstance(value, list):
+                values.update(str(x).strip() for x in value if str(x).strip())
+            elif value:
+                values.add(str(value).strip())
+    except Exception:
+        pass
+    return sorted(values or set(fallback), key=str.casefold)
+
+
+def _catalog_counts(db, field: str):
+    counts = {}
+    try:
+        rows = db.courses.aggregate([
+            {"$match": {"is_published": True}},
+            {"$project": {"values": {"$cond": [
+                {"$isArray": f"${field}"},
+                f"${field}",
+                [{"$ifNull": [f"${field}", "General"]}],
+            ]}}},
+            {"$unwind": "$values"},
+            {"$group": {"_id": "$values", "count": {"$sum": 1}}},
+        ])
+        counts = {str(row["_id"]): int(row["count"]) for row in rows if row.get("_id")}
+    except Exception:
+        counts = {}
+    return counts
+
+
+@router.get("/catalog/categories")
+def catalog_categories(user=Depends(current_user)):
+    """Return the student catalogue taxonomy used by Home, Courses and Quizzes."""
+    db = get_db()
+    categories = _catalog_values(db, "categories", EXAM_CATEGORIES)
+    # Legacy `category` values must also be included.
+    try:
+        categories = sorted(set(categories) | {str(x).strip() for x in db.courses.distinct("category", {"is_published": True}) if x}, key=str.casefold)
+    except Exception:
+        pass
+    subjects = _catalog_values(db, "subject", SUBJECTS)
+    try:
+        subjects = sorted(set(subjects) | {str(x).strip() for x in db.quizzes.distinct("subject", {"is_published": True}) if x}, key=str.casefold)
+    except Exception:
+        pass
+    exams = _catalog_values(db, "exam", EXAM_CATEGORIES)
+    levels = _catalog_values(db, "level", ["Beginner", "Intermediate", "Advanced"])
+    category_counts = _catalog_counts(db, "categories")
+    subject_counts = _catalog_counts(db, "subject")
+    return {
+        "categories": categories,
+        "exams": exams,
+        "subjects": subjects,
+        "levels": levels,
+        "category_counts": category_counts,
+        "subject_counts": subject_counts,
+    }
+
+
+@router.get("/catalog/featured")
+def catalog_featured(limit: int = Query(8, ge=1, le=30), user=Depends(current_user)):
+    """Return a small, published dashboard feed without changing the full lists."""
+    db = get_db()
+    user_id = uid(user)
+    courses_data = [
+        clean(normalize_category_document(x))
+        for x in db.courses.find({"is_published": True}).sort([("featured", -1), ("created_at", -1)]).limit(limit)
+    ]
+
+    quizzes_data = list(
+        db.quizzes.find({"is_published": True})
+        .sort([("featured", -1), ("created_at", -1)])
+        .limit(limit)
+    )
+    submitted = list(db.test_attempts.find({"user_id": user_id, "status": "submitted"}, {"test_id": 1}))
+    attempted_ids = {str(x.get("test_id")) for x in submitted if x.get("test_id") is not None}
+    related = list(db.quizzes.find({"_id": {"$in": list(attempted_ids)}}, {"_id": 1, "title": 1, "name": 1, "subject": 1, "quiz_group_key": 1})) if attempted_ids else []
+    completed_keys = {
+        x.get("quiz_group_key") or quiz_group_key(x.get("title") or x.get("name"), x.get("subject"))
+        for x in related
+    }
+    quiz_items = []
+    for x in quizzes_data:
+        item = clean(normalize_category_document(x))
+        item["question_count"] = len(x.get("question_ids", []) or [])
+        item["quiz_group_key"] = x.get("quiz_group_key") or quiz_group_key(x.get("title") or x.get("name"), x.get("subject"))
+        item["is_completed"] = item["quiz_group_key"] in completed_keys
+        item["completion_status"] = "completed" if item["is_completed"] else "not_started"
+        quiz_items.append(item)
+    return {"courses": courses_data, "quizzes": quiz_items}
+
 
 @router.get("/dashboard")
 def dashboard(user=Depends(current_user)):
@@ -214,7 +317,7 @@ def profile(user=Depends(current_user)):
     return {"id": uid(user), "name": user.get("name",""), "email": user.get("email",""), "role": user.get("role","student"), "is_active": user.get("is_active",True)}
 
 @router.get("/courses")
-def courses(search: str | None = None, category: str | None = None, exam: str | None = None, level: str | None = None, language: str | None = None, free_only: bool = True, subject: str | None = None, user=Depends(current_user)):
+def courses(search: str | None = None, category: str | None = None, exam: str | None = None, level: str | None = None, language: str | None = None, free_only: bool = False, subject: str | None = None, user=Depends(current_user)):
     db=get_db(); user_id=uid(user)
     key=f"courses:{user_id}:{search or ''}:{category or ''}:{exam or ''}:{level or ''}:{language or ''}:{subject or ''}:{free_only}"
     cached=cache.get(key)
@@ -226,7 +329,8 @@ def courses(search: str | None = None, category: str | None = None, exam: str | 
             {"description":{"$regex":search,"$options":"i"}}, {"exam":{"$regex":search,"$options":"i"}},
             {"tags":{"$regex":search,"$options":"i"}}, {"subject":{"$regex":search,"$options":"i"}}
         ]})
-    if category: conditions.append({"$or":[{"categories":category},{"category":{"$regex":f"^{category}$","$options":"i"}}]})
+    if category:
+        conditions.append({"$or":[{"categories":category},{"category":{"$regex":f"^{category}$","$options":"i"}},{"exam":{"$regex":f"^{category}$","$options":"i"}}]})
     if exam: conditions.append({"exam":{"$regex":exam,"$options":"i"}})
     if subject: conditions.append({"subject":{"$regex":f"^{subject}$","$options":"i"}})
     if level: conditions.append({"level":{"$regex":level,"$options":"i"}})
@@ -297,6 +401,39 @@ def course_overview(course_id:str,user=Depends(current_user)):
     }
     cache.set(key,result,TTL_COURSE_OVERVIEW)
     return result
+
+
+@router.get("/courses/{course_id}")
+def course(course_id: str, user=Depends(current_user)):
+    return clean(normalize_category_document(published("courses", course_id)))
+
+
+@router.get("/courses/{course_id}/modules")
+def course_modules(course_id: str, user=Depends(current_user)):
+    published("courses", course_id)
+    return [clean(x) for x in get_db().topics.find({"course_id": course_id, "is_published": True}).sort("order", 1)]
+
+
+@router.get("/modules/{module_id}")
+def module(module_id: str, user=Depends(current_user)):
+    return clean(published("topics", module_id))
+
+
+@router.get("/modules/{module_id}/lessons")
+def module_lessons(module_id: str, user=Depends(current_user)):
+    published("topics", module_id)
+    return [clean(x) for x in get_db().lessons.find({"topic_id": module_id, "is_published": True}).sort("order", 1)]
+
+
+@router.get("/lessons")
+def lessons(course_id: str | None = None, module_id: str | None = None, user=Depends(current_user)):
+    q = {"is_published": True}
+    if course_id:
+        q["course_id"] = course_id
+    if module_id:
+        q["topic_id"] = module_id
+    return [clean(x) for x in get_db().lessons.find(q).sort("order", 1)]
+
 
 @router.get("/enrollments")
 def enrollments(user=Depends(current_user)):
