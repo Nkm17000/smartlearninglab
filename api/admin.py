@@ -87,46 +87,15 @@ def dashboard(user=Depends(admin_user)):
 
 # Courses
 @router.get("/courses")
-def courses(
-    search: str | None = None,
-    category: str | None = None,
-    status: str | None = None,
-    level: str | None = None,
-    language: str | None = None,
-    user=Depends(admin_user),
-):
-    """Admin course list with optional filters.
-
-    All filters are optional so existing callers remain fully compatible.
-    status accepts: all, published, unpublished (or draft).
-    """
-    conditions = []
-    if search and search.strip():
-        value = search.strip()
-        conditions.append({"$or": [
-            {"name": {"$regex": value, "$options": "i"}},
-            {"title": {"$regex": value, "$options": "i"}},
-            {"description": {"$regex": value, "$options": "i"}},
-            {"short_description": {"$regex": value, "$options": "i"}},
-            {"exam": {"$regex": value, "$options": "i"}},
-            {"subcategory": {"$regex": value, "$options": "i"}},
-        ]})
-    if category and category.lower() != "all":
-        conditions.append({"category": category})
-    if level and level.lower() != "all":
-        conditions.append({"level": level})
-    if language and language.lower() != "all":
-        conditions.append({"language": language})
-    if status and status.lower() != "all":
-        conditions.append({"is_published": status.lower() == "published"})
-    q = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
+def courses(search: str | None = None, user=Depends(admin_user)):
+    q = {}
+    if search:
+        q = {"$or": [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"title": {"$regex": search, "$options": "i"}},
+            {"description": {"$regex": search, "$options": "i"}},
+        ]}
     return [clean(x) for x in get_db().courses.find(q).sort("created_at", -1)]
-
-@router.get("/quiz-categories")
-def quiz_categories(user=Depends(admin_user)):
-    values = get_db().quizzes.distinct("category")
-    values = sorted({str(x).strip() for x in values if x is not None and str(x).strip()}, key=str.casefold)
-    return {"categories": values}
 
 @router.post("/courses")
 def create_course(data: dict, user=Depends(admin_user)):
@@ -180,6 +149,13 @@ def delete_course(course_id: str, user=Depends(admin_user)):
 
 @router.post("/courses/{course_id}/publish")
 def publish_course(course_id: str, user=Depends(admin_user)):
+    course = find_by_id("courses", course_id)
+    if not course:
+        raise HTTPException(404, "Course not found")
+    db = get_db()
+    lesson_count = db.lessons.count_documents({"course_id": course_id})
+    if lesson_count == 0:
+        raise HTTPException(400, "Add at least one lesson before publishing the course")
     return update_doc("courses", course_id, {"is_published": True})
 
 @router.post("/courses/{course_id}/unpublish")
@@ -263,6 +239,14 @@ def update_lesson(lesson_id: str, data: dict, user=Depends(admin_user)):
 def delete_lesson(lesson_id: str, user=Depends(admin_user)):
     return delete_doc("lessons", lesson_id)
 
+@router.post("/lessons/{lesson_id}/publish")
+def publish_lesson(lesson_id: str, user=Depends(admin_user)):
+    return update_doc("lessons", lesson_id, {"is_published": True})
+
+@router.post("/lessons/{lesson_id}/unpublish")
+def unpublish_lesson(lesson_id: str, user=Depends(admin_user)):
+    return update_doc("lessons", lesson_id, {"is_published": False})
+
 # Questions
 @router.get("/questions")
 def questions(search: str | None = None, difficulty: str | None = None, user=Depends(admin_user)):
@@ -303,39 +287,10 @@ def delete_question(question_id: str, user=Depends(admin_user)):
 
 # Quizzes
 @router.get("/quizzes")
-def quizzes(
-    search: str | None = None,
-    category: str | None = None,
-    status: str | None = None,
-    quiz_type: str | None = None,
-    has_questions: str | None = None,
-    user=Depends(admin_user),
-):
-    """Admin quiz list with optional filters. Existing no-argument calls are unchanged."""
-    conditions = []
-    if search and search.strip():
-        value = search.strip()
-        conditions.append({"$or": [
-            {"title": {"$regex": value, "$options": "i"}},
-            {"name": {"$regex": value, "$options": "i"}},
-            {"description": {"$regex": value, "$options": "i"}},
-            {"exam": {"$regex": value, "$options": "i"}},
-        ]})
-    if category and category.lower() != "all":
-        conditions.append({"category": category})
-    if status and status.lower() != "all":
-        conditions.append({"is_published": status.lower() == "published"})
-    if quiz_type and quiz_type.lower() != "all":
-        if quiz_type.lower() == "standalone":
-            conditions.append({"$or": [{"course_id": None}, {"course_id": {"$exists": False}}]})
-        elif quiz_type.lower() == "course":
-            conditions.append({"course_id": {"$nin": [None, ""]}})
-    if has_questions and has_questions.lower() != "all":
-        if has_questions.lower() in ("yes", "ready", "true"):
-            conditions.append({"question_ids.0": {"$exists": True}})
-        elif has_questions.lower() in ("no", "empty", "false"):
-            conditions.append({"$or": [{"question_ids": {"$exists": False}}, {"question_ids": []}]})
-    q = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
+def quizzes(search: str | None = None, user=Depends(admin_user)):
+    q = {}
+    if search:
+        q = {"$or": [{"title": {"$regex": search, "$options": "i"}}, {"name": {"$regex": search, "$options": "i"}}]}
     return [clean(x) for x in get_db().quizzes.find(q).sort("created_at", -1)]
 
 @router.post("/quizzes")
@@ -368,9 +323,169 @@ def update_quiz(quiz_id: str, data: dict, user=Depends(admin_user)):
 def delete_quiz(quiz_id: str, user=Depends(admin_user)):
     return delete_doc("quizzes", quiz_id)
 
+@router.post("/quizzes/publish-all")
+def publish_all_quizzes(user=Depends(admin_user)):
+    """Publish every draft quiz that has valid question references.
+
+    This is intentionally a database-wide operation rather than a frontend
+    loop over the currently filtered quiz list. Empty or broken quizzes are
+    skipped and returned to the admin with a reason.
+    """
+    db = get_db()
+    quizzes_to_check = list(db.quizzes.find({"is_published": {"$ne": True}}))
+
+    published_count = 0
+    skipped = []
+
+    for quiz_doc in quizzes_to_check:
+        quiz_id = str(quiz_doc.get("_id"))
+        title = quiz_doc.get("title") or quiz_doc.get("name") or "Untitled Quiz"
+        question_ids = list(quiz_doc.get("question_ids", []) or [])
+
+        if not question_ids:
+            skipped.append({
+                "id": quiz_id,
+                "title": title,
+                "reason": "No questions attached",
+            })
+            continue
+
+        missing = [
+            str(qid)
+            for qid in question_ids
+            if not find_by_id("questions", str(qid))
+        ]
+        if missing:
+            skipped.append({
+                "id": quiz_id,
+                "title": title,
+                "reason": f"Missing question(s): {', '.join(missing)}",
+            })
+            continue
+
+        update_doc(
+            "quizzes",
+            quiz_id,
+            {"is_published": True, "published_at": now()},
+        )
+        published_count += 1
+
+    return {
+        "message": f"Published {published_count} quiz(es).",
+        "published_count": published_count,
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+    }
+
+@router.post("/quizzes/manual")
+def create_manual_quiz(data: dict, user=Depends(admin_user)):
+    """Create a complete 10-question standalone quiz as a draft."""
+    title = str(data.get("title") or data.get("name") or "").strip()
+    if not title:
+        raise HTTPException(422, "Quiz title is required")
+
+    questions_data = data.get("questions")
+    if not isinstance(questions_data, list) or len(questions_data) != 10:
+        raise HTTPException(422, "Manual quiz must contain exactly 10 questions")
+
+    question_ids = []
+    created_questions = []
+
+    try:
+        for index, item in enumerate(questions_data, start=1):
+            if not isinstance(item, dict):
+                raise HTTPException(422, f"Question {index} is invalid")
+
+            question_text = str(item.get("question") or "").strip()
+            options = item.get("options")
+            if not question_text:
+                raise HTTPException(422, f"Question {index} is required")
+            if not isinstance(options, list) or len(options) != 4:
+                raise HTTPException(422, f"Question {index} must have exactly 4 options")
+            if any(not str(option).strip() for option in options):
+                raise HTTPException(422, f"All 4 options are required for question {index}")
+
+            try:
+                correct_answer = int(item.get("correct_answer", 0))
+            except (TypeError, ValueError):
+                raise HTTPException(422, f"Correct answer for question {index} is invalid")
+            if correct_answer not in range(4):
+                raise HTTPException(422, f"Correct answer for question {index} must be A, B, C or D")
+
+            q = {
+                "question": question_text,
+                "question_type": "mcq",
+                "options": [str(option).strip() for option in options],
+                "correct_answer": correct_answer,
+                "difficulty": str(item.get("difficulty") or "easy").lower(),
+                "marks": float(item.get("marks", 1) or 1),
+                "negative_marks": float(item.get("negative_marks", 0) or 0),
+                "explanation": str(item.get("explanation") or ""),
+                "is_published": True,
+            }
+
+            created = create_doc("questions", q, True)
+            created_questions.append(created)
+            question_ids.append(created["_id"])
+
+        quiz_data = {
+            "title": title,
+            "name": title,
+            "subject": str(data.get("subject") or "").strip(),
+            "topic": str(data.get("topic") or "").strip(),
+            "category": str(data.get("category") or data.get("subject") or "General").strip(),
+            "exam": str(data.get("exam") or "").strip(),
+            "description": str(data.get("description") or "").strip(),
+            "course_id": None,
+            "module_id": None,
+            "duration_minutes": int(data.get("duration_minutes", 15) or 15),
+            "passing_percentage": int(data.get("passing_percentage", 60) or 60),
+            "max_attempts": int(data.get("max_attempts", 3) or 3),
+            "question_ids": question_ids,
+            "is_published": False,
+            "quiz_type": "standalone",
+            "source": "manual",
+        }
+        quiz_doc = create_doc("quizzes", quiz_data, True)
+
+        return {
+            "message": "Manual quiz created successfully as draft.",
+            "quiz": clean(quiz_doc),
+            "questions": clean(created_questions),
+        }
+    except HTTPException:
+        # Roll back questions created during validation/creation if a later
+        # question fails, so a failed manual quiz does not leave orphan data.
+        for q in created_questions:
+            try:
+                get_db().questions.delete_one({"_id": q["_id"]})
+            except Exception:
+                pass
+        raise
+
 @router.post("/quizzes/{quiz_id}/publish")
 def publish_quiz(quiz_id: str, user=Depends(admin_user)):
-    return update_doc("quizzes", quiz_id, {"is_published": True})
+    quiz_doc = find_by_id("quizzes", quiz_id)
+    if not quiz_doc:
+        raise HTTPException(404, "Quiz not found")
+
+    question_ids = list(quiz_doc.get("question_ids", []) or [])
+    if not question_ids:
+        raise HTTPException(400, "Add at least one question before publishing the quiz")
+
+    missing = [
+        str(qid)
+        for qid in question_ids
+        if not find_by_id("questions", str(qid))
+    ]
+    if missing:
+        raise HTTPException(400, f"Quiz contains missing question(s): {', '.join(missing)}")
+
+    return update_doc(
+        "quizzes",
+        quiz_id,
+        {"is_published": True, "published_at": now()},
+    )
 
 @router.post("/quizzes/{quiz_id}/unpublish")
 def unpublish_quiz(quiz_id: str, user=Depends(admin_user)):
