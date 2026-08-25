@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import io, uuid, json
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Body, Depends, HTTPException, UploadFile, File, Form
 from app.core.security import admin_user
 from app.db.mongo import get_db
 from app.api.media import COURSE_CATEGORIES, upload_bytes
@@ -256,7 +256,7 @@ def create_quiz_drafts(payload, user):
 
 
 @router.post("/quiz")
-def bulk_quiz(data, user=Depends(admin_user)):
+def bulk_quiz(data: object = Body(...), user=Depends(admin_user)):
     return create_quiz_drafts(data, user)
 
 
