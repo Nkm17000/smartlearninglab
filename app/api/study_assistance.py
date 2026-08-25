@@ -148,7 +148,7 @@ def study_assistance(user=Depends(current_user)):
     quiz_ids = list({str(x.get("test_id")) for x in attempts if x.get("test_id") is not None})
     quizzes = list(db.quizzes.find(
         {"_id": {"$in": quiz_ids}},
-        {"title": 1, "name": 1, "course_id": 1, "category": 1, "categories": 1, "subject": 1},
+        {"title": 1, "name": 1, "course_id": 1, "category": 1},
     )) if quiz_ids else []
     quiz_by_id = {str(x.get("_id")): x for x in quizzes}
 
@@ -161,7 +161,7 @@ def study_assistance(user=Depends(current_user)):
         result = attempt.get("result") or {}
         quiz_id = str(attempt.get("test_id") or "")
         quiz = quiz_by_id.get(quiz_id) or {}
-        topic = first_text(quiz, "subject", default=first_text(quiz, "category", default="General practice"))
+        topic = first_text(quiz, "category", default="General practice")
         for detail in result.get("details", []) or []:
             weak[topic]["total"] += 1
             if not detail.get("correct"):

@@ -1,0 +1,45 @@
+[
+  {
+    "title": "English Grammar - Noun",
+    "subject": "English",
+    "categories": [
+      "SSC",
+      "Railway",
+      "Banking",
+      "UPSC",
+      "Teaching",
+      "Defence",
+      "State Exams",
+      "General",
+      "English Spoken",
+      "Other"
+    ],
+    "description": "10-question practice test",
+    "passing_percentage": 60,
+    "duration_minutes": 20,
+    "questions": [
+      {
+        "question": "Which of the following is a proper noun?",
+        "options": ["city", "country", "Delhi", "river"],
+        "correct_answer": 2,
+        "explanation": "Delhi is the specific name of a city, so it is a proper noun."
+      }
+    ]
+  },
+  {
+    "title": "Java - OOP Concepts",
+    "subject": "Java",
+    "categories": ["Computer"],
+    "description": "Practice test on Java OOP concepts",
+    "passing_percentage": 60,
+    "duration_minutes": 20,
+    "questions": [
+      {
+        "question": "Which OOP concept allows a class to acquire properties and methods of another class?",
+        "options": ["Encapsulation", "Inheritance", "Polymorphism", "Abstraction"],
+        "correct_answer": 1,
+        "explanation": "Inheritance allows a class to acquire properties and methods from another class."
+      }
+    ]
+  }
+]
