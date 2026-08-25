@@ -3,6 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.security import admin_user, root_admin_user, hash_password
 from app.db.mongo import get_db
+from app.services.taxonomy import ensure_seed, all_taxonomy, resolve_links, default_links_for_subject, now as taxonomy_now, clean as taxonomy_clean
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
 COURSE_CATEGORIES = ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','English Spoken','Computer','Other']
@@ -106,6 +107,112 @@ def delete_doc(collection, item_id):
     get_db()[collection].delete_one({"_id": old["_id"]})
     return {"message": "Deleted", "id": str(old["_id"])}
 
+
+# Taxonomy: categories and subcategories are first-class admin data.
+@router.get("/taxonomy")
+def taxonomy(user=Depends(admin_user)):
+    return {"categories": all_taxonomy()}
+
+@router.get("/categories")
+def categories(user=Depends(admin_user)):
+    return {"categories": all_taxonomy()}
+
+@router.post("/categories")
+def create_category(data: dict, user=Depends(admin_user)):
+    db = ensure_seed()
+    name = str(data.get("name", "")).strip()
+    if not name:
+        raise HTTPException(422, "Category name is required")
+    from app.services.taxonomy import slug
+    sid = slug(name)
+    if db.categories.find_one({"slug": sid}):
+        raise HTTPException(409, "Category already exists")
+    doc = {"_id": sid, "name": name, "slug": sid, "is_active": True, "created_at": taxonomy_now(), "updated_at": taxonomy_now()}
+    db.categories.insert_one(doc)
+    return taxonomy_clean(doc)
+
+@router.put("/categories/{category_id}")
+def update_category(category_id: str, data: dict, user=Depends(admin_user)):
+    db = ensure_seed()
+    old = db.categories.find_one({"_id": category_id})
+    if not old:
+        raise HTTPException(404, "Category not found")
+    name = str(data.get("name", old.get("name", ""))).strip()
+    if not name:
+        raise HTTPException(422, "Category name is required")
+    from app.services.taxonomy import slug
+    new_slug = slug(name)
+    duplicate = db.categories.find_one({"slug": new_slug, "_id": {"$ne": category_id}})
+    if duplicate:
+        raise HTTPException(409, "Another category already has this name")
+    db.categories.update_one({"_id": category_id}, {"$set": {"name": name, "slug": new_slug, "is_active": bool(data.get("is_active", True)), "updated_at": taxonomy_now()}})
+    return taxonomy_clean(db.categories.find_one({"_id": category_id}))
+
+@router.delete("/categories/{category_id}")
+def delete_category(category_id: str, user=Depends(admin_user)):
+    db = ensure_seed()
+    if not db.categories.find_one({"_id": category_id}):
+        raise HTTPException(404, "Category not found")
+    if db.subcategories.count_documents({"category_id": category_id, "is_active": {"$ne": False}}):
+        raise HTTPException(409, "Remove or deactivate its subcategories before deleting the category")
+    db.categories.update_one({"_id": category_id}, {"$set": {"is_active": False, "updated_at": taxonomy_now()}})
+    return {"message": "Category deactivated"}
+
+@router.get("/categories/{category_id}/subcategories")
+def list_subcategories(category_id: str, user=Depends(admin_user)):
+    db = ensure_seed()
+    if not db.categories.find_one({"_id": category_id}):
+        raise HTTPException(404, "Category not found")
+    return [taxonomy_clean(x) for x in db.subcategories.find({"category_id": category_id, "is_active": {"$ne": False}}).sort("name", 1)]
+
+@router.post("/categories/{category_id}/subcategories")
+def create_subcategory(category_id: str, data: dict, user=Depends(admin_user)):
+    db = ensure_seed()
+    if not db.categories.find_one({"_id": category_id}):
+        raise HTTPException(404, "Category not found")
+    name = str(data.get("name", "")).strip()
+    if not name:
+        raise HTTPException(422, "Subcategory name is required")
+    from app.services.taxonomy import slug
+    sid = f"{category_id}:{slug(name)}"
+    if db.subcategories.find_one({"_id": sid}):
+        raise HTTPException(409, "Subcategory already exists under this category")
+    doc = {"_id": sid, "category_id": category_id, "name": name, "slug": slug(name), "is_active": True, "created_at": taxonomy_now(), "updated_at": taxonomy_now()}
+    db.subcategories.insert_one(doc)
+    return taxonomy_clean(doc)
+
+@router.put("/subcategories/{subcategory_id}")
+def update_subcategory(subcategory_id: str, data: dict, user=Depends(admin_user)):
+    db = ensure_seed()
+    old = db.subcategories.find_one({"_id": subcategory_id})
+    if not old:
+        raise HTTPException(404, "Subcategory not found")
+    name = str(data.get("name", old.get("name", ""))).strip()
+    if not name:
+        raise HTTPException(422, "Subcategory name is required")
+    from app.services.taxonomy import slug
+    duplicate = db.subcategories.find_one({"category_id": old["category_id"], "slug": slug(name), "_id": {"$ne": subcategory_id}})
+    if duplicate:
+        raise HTTPException(409, "Another subcategory already exists under this category")
+    db.subcategories.update_one({"_id": subcategory_id}, {"$set": {"name": name, "slug": slug(name), "is_active": bool(data.get("is_active", True)), "updated_at": taxonomy_now()}})
+    return taxonomy_clean(db.subcategories.find_one({"_id": subcategory_id}))
+
+@router.delete("/subcategories/{subcategory_id}")
+def delete_subcategory(subcategory_id: str, user=Depends(admin_user)):
+    db = ensure_seed()
+    if not db.subcategories.find_one({"_id": subcategory_id}):
+        raise HTTPException(404, "Subcategory not found")
+    db.subcategories.update_one({"_id": subcategory_id}, {"$set": {"is_active": False, "updated_at": taxonomy_now()}})
+    return {"message": "Subcategory deactivated"}
+
+
+def resolve_admin_links(data, subject):
+    category_values = data.get("category_ids", data.get("categories", data.get("category")))
+    subcategory_values = data.get("subcategory_ids", data.get("subcategories", data.get("subcategory")))
+    if subcategory_values is None and isinstance(data.get("category"), str) and data.get("category", "").strip().casefold() == str(subject).strip().casefold():
+        return default_links_for_subject(subject)
+    return resolve_links(data.get("category_ids"), category_values, data.get("subcategory_ids"), subcategory_values)
+
 # Dashboard
 @router.get("/dashboard")
 def dashboard(user=Depends(admin_user)):
@@ -132,6 +239,8 @@ def course_categories(user=Depends(admin_user)):
 def courses(
     search: str | None = None,
     category: str | None = None,
+    subject: str | None = None,
+    subcategory: str | None = None,
     status: str | None = None,
     level: str | None = None,
     language: str | None = None,
@@ -157,10 +266,18 @@ def courses(
         ]})
     if category and category.lower() != "all":
         conditions.append({"$or": [{"categories": category}, {"category": category}]})
+    if subject and subject.lower() != "all":
+        conditions.append({"subject": {"$regex": f"^{subject.strip()}$", "$options": "i"}})
+    if subcategory and subcategory.lower() != "all":
+        conditions.append({"$or": [{"subcategories": subcategory}, {"subcategory": subcategory}]})
     if level and level.lower() != "all":
         conditions.append({"level": level})
     if language and language.lower() != "all":
         conditions.append({"language": language})
+    if subject and subject.lower() != "all":
+        conditions.append({"subject": {"$regex": f"^{subject.strip()}$", "$options": "i"}})
+    if subcategory and subcategory.lower() != "all":
+        conditions.append({"$or": [{"subcategories": subcategory}, {"subcategory": subcategory}]})
     if status and status.lower() != "all":
         conditions.append({"is_published": status.lower() == "published"})
     q = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
@@ -188,10 +305,10 @@ def create_course(data: dict, user=Depends(admin_user)):
     d.setdefault("short_description", "")
     d.setdefault("level", "Beginner")
     d["subject"] = str(d.get("subject", "Other") or "Other").strip()
-    d["categories"] = normalize_categories(d.get("categories", d.get("category")), d.get("subject"))
-    # Keep the legacy singular field so older screens continue to work.
+    links = resolve_admin_links(d, d.get("subject"))
+    d.update(links)
     d["category"] = d["categories"][0]
-    d.setdefault("subcategory", "")
+    d["subcategory"] = d["subcategories"][0]
     d.setdefault("audience", "")
     d.setdefault("language", "English")
     d.setdefault("learning_objectives", [])
@@ -224,9 +341,11 @@ def update_course(course_id: str, data: dict, user=Depends(admin_user)):
     subject = str(payload.get("subject", "") or "").strip()
     if subject:
         payload["subject"] = subject
-    if "categories" in payload or "category" in payload:
-        payload["categories"] = normalize_categories(payload.get("categories", payload.get("category")), subject or "Other")
+    if any(k in payload for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory")):
+        links = resolve_admin_links(payload, subject or "Other")
+        payload.update(links)
         payload["category"] = payload["categories"][0]
+        payload["subcategory"] = payload["subcategories"][0]
     return update_doc("courses", course_id, payload)
 
 @router.delete("/courses/{course_id}")
@@ -456,6 +575,8 @@ def delete_question(question_id: str, user=Depends(admin_user)):
 def quizzes(
     search: str | None = None,
     category: str | None = None,
+    subject: str | None = None,
+    subcategory: str | None = None,
     status: str | None = None,
     quiz_type: str | None = None,
     has_questions: str | None = None,
@@ -501,6 +622,12 @@ def create_quiz(data: dict, user=Depends(admin_user)):
     d.setdefault("passing_percentage", 60)
     d.setdefault("max_attempts", 3)
     d.setdefault("question_ids", [])
+    d["subject"] = str(d.get("subject", "Other") or "Other").strip()
+    links = resolve_admin_links(d, d.get("subject"))
+    d.update(links)
+    d["category"] = d["categories"][0]
+    d["subcategory"] = d["subcategories"][0]
+    d["quiz_group_key"] = (d["subject"] + "|" + d["title"]).casefold().strip()
     d.setdefault("is_published", False)
     return create_doc("quizzes", d, True)
 
@@ -512,7 +639,16 @@ def quiz(quiz_id: str, user=Depends(admin_user)):
 
 @router.put("/quizzes/{quiz_id}")
 def update_quiz(quiz_id: str, data: dict, user=Depends(admin_user)):
-    return update_doc("quizzes", quiz_id, data)
+    payload = dict(data or {})
+    if any(k in payload for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory")):
+        links = resolve_admin_links(payload, payload.get("subject") or "Other")
+        payload.update(links)
+        payload["category"] = payload["categories"][0]
+        payload["subcategory"] = payload["subcategories"][0]
+    if payload.get("title") or payload.get("name"):
+        title = str(payload.get("title") or payload.get("name")).strip()
+        payload["quiz_group_key"] = (str(payload.get("subject", "Other")) + "|" + title).casefold().strip()
+    return update_doc("quizzes", quiz_id, payload)
 
 @router.delete("/quizzes/{quiz_id}")
 def delete_quiz(quiz_id: str, user=Depends(admin_user)):

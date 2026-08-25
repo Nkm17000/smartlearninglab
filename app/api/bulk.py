@@ -5,6 +5,7 @@ from app.core.security import admin_user
 from app.db.mongo import get_db
 from app.api.media import COURSE_CATEGORIES, upload_bytes
 from app.services.pdf_course_importer import build_course_from_pdf
+from app.services.taxonomy import ensure_seed, resolve_links, default_links_for_subject
 
 router = APIRouter(prefix="/api/v1/admin/bulk", tags=["Admin Bulk Content"])
 
@@ -197,15 +198,26 @@ def normalize_quiz_documents(payload):
         raw_categories = document.get("categories")
         if raw_categories is None and isinstance(legacy_category, str) and legacy_category.strip() in COURSE_CATEGORIES:
             raw_categories = legacy_category
-        categories = normalize_categories(raw_categories, subject)
+        # New taxonomy is authoritative: category/subcategory names or IDs are
+        # resolved against the admin taxonomy collections.
+        raw_subcategories = document.get("subcategories", document.get("subcategory"))
+        if raw_subcategories is None and raw_categories is None and isinstance(legacy_category, str):
+            # Legacy format: category carried the subject, e.g. {category:"English"}.
+            links = default_links_for_subject(subject)
+        else:
+            links = resolve_links(
+                document.get("category_ids"), raw_categories,
+                document.get("subcategory_ids"), raw_subcategories
+            )
 
         normalized.append({
             "source_index": index,
             "title": title,
             "description": str(document.get("description", "")).strip(),
             "subject": subject,
-            "categories": categories,
-            "category": categories[0],
+            **links,
+            "category": links["categories"][0],
+            "subcategory": links["subcategories"][0],
             "course_id": document.get("course_id"),
             "module_id": document.get("module_id"),
             "topic": topic,
@@ -244,8 +256,12 @@ def create_quiz_drafts(payload, user):
             "module_id": document["module_id"],
             "topic": document["topic"],
             "subject": document["subject"],
+            "category_ids": document["category_ids"],
             "categories": document["categories"],
+            "subcategory_ids": document["subcategory_ids"],
+            "subcategories": document["subcategories"],
             "category": document["category"],
+            "subcategory": document["subcategory"],
             "quiz_group_key": (document["subject"] + "|" + document["title"]).casefold().strip(),
             "duration_minutes": document["duration_minutes"],
             "passing_percentage": document["passing_percentage"],
@@ -313,11 +329,11 @@ async def bulk_quiz_file(file: UploadFile = File(...), user=Depends(admin_user))
 
 
 @router.post("/course-pdf")
-async def bulk_course_pdf(file:UploadFile=File(...),title:str=Form(""),subject:str=Form("Other"),categories:str=Form(""),category:str=Form(""),level:str=Form("Beginner"),language:str=Form("English"),user=Depends(admin_user)):
+async def bulk_course_pdf(file:UploadFile=File(...),title:str=Form(""),subject:str=Form("Other"),categories:str=Form(""),category:str=Form(""),subcategories:str=Form(""),subcategory:str=Form(""),category_ids:str=Form(""),subcategory_ids:str=Form(""),level:str=Form("Beginner"),language:str=Form("English"),user=Depends(admin_user)):
     if not file.filename: raise HTTPException(422,"PDF file is required")
     if not file.filename.lower().endswith(".pdf"): raise HTTPException(422,"Only PDF files are supported")
     subject = str(subject or "Other").strip() or "Other"
-    category_list = normalize_categories(categories or category, subject)
+    links = resolve_links(category_ids, categories or category, subcategory_ids, subcategories or subcategory)
     raw=await file.read()
     if len(raw)>100*1024*1024: raise HTTPException(413,"PDF is too large. Maximum supported size is 100 MB.")
 
@@ -341,14 +357,14 @@ async def bulk_course_pdf(file:UploadFile=File(...),title:str=Form(""),subject:s
     source_pdf_url=f"/api/v1/media/{media_id}"
     course_id=uuid.uuid4().hex
     course_title=(title or generated.get("title") or file.filename).strip()
-    course={"_id":course_id,"name":course_title,"title":course_title,"description":f"Course generated from {file.filename}. The PDF structure is used as the source of truth; no lesson content is invented.","short_description":f"Imported from {file.filename}"[:180],"subject":subject,"categories":category_list,"category":category_list[0],"subcategory":"","level":level,"language":language,"is_free":True,"featured":False,"is_published":False,"learning_objectives":[],"prerequisites":[],"estimated_minutes":0,"instructor_name":"Smart Learning Lab","exam":"General","tags":[x.lower() for x in category_list],"rating":0,"students_count":0,"video_count":0,"pdf_count":1,"mock_test_count":0,"source_pdf_name":file.filename,"source_pdf_size":len(raw),"source_pdf_media_id":str(media_id),"source_pdf_storage_key":storage_key,"source_pdf_url":source_pdf_url,"source_pdf_page_count":generated.get("page_count",0),"pdf_import_strategy":generated.get("strategy"),"pdf_import_report":{"toc_pages":generated.get("toc_pages",[]),"source_topic_count":generated.get("source_topic_count",0),"missing_topics":generated.get("missing_topics",0),"lessons_with_content":generated.get("lessons_with_content",0)},"bulk_imported":True,"created_at":now(),"updated_at":now(),"created_by":uid(user)}
+    course={"_id":course_id,"name":course_title,"title":course_title,"description":f"Course generated from {file.filename}. The PDF structure is used as the source of truth; no lesson content is invented.","short_description":f"Imported from {file.filename}"[:180],"subject":subject,"category_ids":links["category_ids"],"categories":links["categories"],"subcategory_ids":links["subcategory_ids"],"subcategories":links["subcategories"],"category":links["categories"][0],"subcategory":links["subcategories"][0],"level":level,"language":language,"is_free":True,"featured":False,"is_published":False,"learning_objectives":[],"prerequisites":[],"estimated_minutes":0,"instructor_name":"Smart Learning Lab","exam":"General","tags":[x.lower() for x in links["categories"] + links["subcategories"]],"rating":0,"students_count":0,"video_count":0,"pdf_count":1,"mock_test_count":0,"source_pdf_name":file.filename,"source_pdf_size":len(raw),"source_pdf_media_id":str(media_id),"source_pdf_storage_key":storage_key,"source_pdf_url":source_pdf_url,"source_pdf_page_count":generated.get("page_count",0),"pdf_import_strategy":generated.get("strategy"),"pdf_import_report":{"toc_pages":generated.get("toc_pages",[]),"source_topic_count":generated.get("source_topic_count",0),"missing_topics":generated.get("missing_topics",0),"lessons_with_content":generated.get("lessons_with_content",0)},"bulk_imported":True,"created_at":now(),"updated_at":now(),"created_by":uid(user)}
     db.courses.insert_one(course)
     db.course_resources.insert_one({"_id":uuid.uuid4().hex,"course_id":course_id,"title":file.filename,"description":"Original PDF used to generate this course.","url":source_pdf_url,"media_id":str(media_id),"storage":"r2","storage_key":storage_key,"filename":file.filename,"content_type":"application/pdf","type":"pdf","source":"bulk_course_pdf_v2","order":1,"created_at":now(),"created_by":uid(user)})
 
     module_count=lesson_count=0
     for mi,module in enumerate(modules,1):
         mid=uuid.uuid4().hex
-        db.topics.insert_one({"_id":mid,"course_id":course_id,"subject":subject,"categories":category_list,"name":module.get("title") or f"Module {mi}","title":module.get("title") or f"Module {mi}","description":module.get("description","") or "Source section from the uploaded PDF.","order":mi,"is_published":False,"created_at":now(),"created_by":uid(user)})
+        db.topics.insert_one({"_id":mid,"course_id":course_id,"subject":subject,"category_ids":links["category_ids"],"categories":links["categories"],"subcategory_ids":links["subcategory_ids"],"subcategories":links["subcategories"],"name":module.get("title") or f"Module {mi}","title":module.get("title") or f"Module {mi}","description":module.get("description","") or "Source section from the uploaded PDF.","order":mi,"is_published":False,"created_at":now(),"created_by":uid(user)})
         module_count+=1
         for li,lesson in enumerate(module.get("lessons",[]),1):
             content=lesson.get("content","")
