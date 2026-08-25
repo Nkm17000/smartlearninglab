@@ -691,6 +691,168 @@ def unpublish_quiz(quiz_id: str, user=Depends(admin_user)):
         raise HTTPException(404, "Quiz not found")
     return update_doc("quizzes", quiz_id, {"is_published": False})
 
+
+@router.post("/quizzes/publish-all")
+def publish_all_quizzes(user=Depends(admin_user)):
+    """Publish every eligible draft quiz.
+
+    A quiz is eligible when it has at least one question and every referenced
+    question exists. Attached questions are published together with the quiz.
+    Invalid/empty quizzes are skipped and reported rather than aborting the
+    entire operation.
+    """
+    db = get_db()
+    drafts = list(db.quizzes.find({"is_published": {"$ne": True}}))
+    published_count = 0
+    skipped = []
+
+    for quiz in drafts:
+        quiz_id = quiz.get("_id")
+        question_ids = list(quiz.get("question_ids", []) or [])
+
+        if not question_ids:
+            skipped.append({
+                "id": str(quiz_id),
+                "title": quiz.get("title") or quiz.get("name") or "Untitled Quiz",
+                "reason": "No questions attached",
+            })
+            continue
+
+        missing = [
+            str(qid)
+            for qid in question_ids
+            if not find_by_id("questions", str(qid))
+        ]
+        if missing:
+            skipped.append({
+                "id": str(quiz_id),
+                "title": quiz.get("title") or quiz.get("name") or "Untitled Quiz",
+                "reason": f"Missing question(s): {', '.join(missing)}",
+            })
+            continue
+
+        # Use a direct update so string/ObjectId IDs in existing data are both
+        # supported by the same list that was validated above.
+        db.questions.update_many(
+            {"_id": {"$in": question_ids}},
+            {"$set": {"is_published": True, "published_at": now()}},
+        )
+        db.quizzes.update_one(
+            {"_id": quiz_id},
+            {"$set": {
+                "is_published": True,
+                "published_at": now(),
+                "updated_at": now(),
+            }},
+        )
+        published_count += 1
+
+    return {
+        "message": f"Published {published_count} quiz(es).",
+        "published_count": published_count,
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+    }
+
+
+@router.post("/quizzes/manual")
+def create_manual_quiz(data: dict, user=Depends(admin_user)):
+    """Create a complete 10-question MCQ quiz as a draft.
+
+    Category/subcategory are upload-level/admin-form metadata and are resolved
+    through the existing taxonomy service. The quiz remains unpublished until
+    the admin explicitly publishes it.
+    """
+    payload = dict(data or {})
+    title = str(payload.get("title") or payload.get("name") or "").strip()
+    subject = str(payload.get("subject") or "Other").strip()
+    topic = str(payload.get("topic") or "").strip()
+    questions = payload.get("questions") or []
+
+    if not title:
+        raise HTTPException(422, "Quiz title is required")
+    if not subject:
+        raise HTTPException(422, "Subject is required")
+    if not topic:
+        raise HTTPException(422, "Topic is required")
+    if len(questions) != 10:
+        raise HTTPException(422, "Manual quiz must contain exactly 10 questions")
+
+    normalized_questions = []
+    for index, item in enumerate(questions, start=1):
+        q = dict(item or {})
+        question_text = str(q.get("question") or "").strip()
+        options = q.get("options") or []
+        if not question_text:
+            raise HTTPException(422, f"Question {index} is required")
+        if not isinstance(options, list) or len(options) != 4:
+            raise HTTPException(422, f"Question {index} must have exactly 4 options")
+        if any(not str(option).strip() for option in options):
+            raise HTTPException(422, f"All four options are required for question {index}")
+
+        try:
+            correct_answer = int(q.get("correct_answer", 0))
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"Invalid correct answer for question {index}")
+        if correct_answer not in (0, 1, 2, 3):
+            raise HTTPException(422, f"Correct answer for question {index} must be 0, 1, 2 or 3")
+
+        normalized_questions.append({
+            "question": question_text,
+            "options": [str(option).strip() for option in options],
+            "correct_answer": correct_answer,
+            "difficulty": str(q.get("difficulty") or "easy").lower(),
+            "marks": float(q.get("marks", 1) or 1),
+            "negative_marks": float(q.get("negative_marks", 0) or 0),
+            "explanation": str(q.get("explanation") or "").strip(),
+            "question_type": "mcq",
+            "is_published": False,
+        })
+
+    # Allow the current FE taxonomy selector to send either category_ids /
+    # subcategory_ids or the legacy names. resolve_admin_links enforces the
+    # category -> subcategory relationship.
+    links = resolve_admin_links(payload, subject)
+
+    db = get_db()
+    question_ids = []
+    created_questions = []
+
+    for q in normalized_questions:
+        q["created_at"] = now()
+        q["updated_at"] = now()
+        result = db.questions.insert_one(q)
+        q["_id"] = result.inserted_id
+        question_ids.append(result.inserted_id)
+        created_questions.append(clean(q))
+
+    quiz_doc = {
+        "title": title,
+        "name": title,
+        "subject": subject,
+        "topic": topic,
+        "description": str(payload.get("description") or "").strip(),
+        "exam": str(payload.get("exam") or "").strip(),
+        "duration_minutes": int(payload.get("duration_minutes", 15) or 15),
+        "passing_percentage": int(payload.get("passing_percentage", 60) or 60),
+        "max_attempts": int(payload.get("max_attempts", 3) or 3),
+        "question_ids": question_ids,
+        "is_published": False,
+        "quiz_group_key": f"{subject}|{title}".casefold().strip(),
+        "created_at": now(),
+        "updated_at": now(),
+    }
+    quiz_doc.update(links)
+
+    result = db.quizzes.insert_one(quiz_doc)
+    quiz_doc["_id"] = result.inserted_id
+
+    return {
+        "message": "Quiz created as draft.",
+        "quiz": clean(quiz_doc),
+        "questions": created_questions,
+    }
+
 @router.post("/quizzes/{quiz_id}/questions")
 def add_quiz_questions(quiz_id: str, data: dict, user=Depends(admin_user)):
     quiz = find_by_id("quizzes", quiz_id)
