@@ -118,15 +118,46 @@ def dashboard(user=Depends(admin_user)):
 
 # Courses
 @router.get("/courses")
-def courses(search: str | None = None, user=Depends(admin_user)):
-    q = {}
-    if search:
-        q = {"$or": [
-            {"name": {"$regex": search, "$options": "i"}},
-            {"title": {"$regex": search, "$options": "i"}},
-            {"description": {"$regex": search, "$options": "i"}},
-        ]}
+def courses(
+    search: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    level: str | None = None,
+    language: str | None = None,
+    user=Depends(admin_user),
+):
+    """Admin course list with optional filters.
+
+    All filters are optional so existing callers remain fully compatible.
+    status accepts: all, published, unpublished (or draft).
+    """
+    conditions = []
+    if search and search.strip():
+        value = search.strip()
+        conditions.append({"$or": [
+            {"name": {"$regex": value, "$options": "i"}},
+            {"title": {"$regex": value, "$options": "i"}},
+            {"description": {"$regex": value, "$options": "i"}},
+            {"short_description": {"$regex": value, "$options": "i"}},
+            {"exam": {"$regex": value, "$options": "i"}},
+            {"subcategory": {"$regex": value, "$options": "i"}},
+        ]})
+    if category and category.lower() != "all":
+        conditions.append({"category": category})
+    if level and level.lower() != "all":
+        conditions.append({"level": level})
+    if language and language.lower() != "all":
+        conditions.append({"language": language})
+    if status and status.lower() != "all":
+        conditions.append({"is_published": status.lower() == "published"})
+    q = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
     return [clean(x) for x in get_db().courses.find(q).sort("created_at", -1)]
+
+@router.get("/quiz-categories")
+def quiz_categories(user=Depends(admin_user)):
+    values = get_db().quizzes.distinct("category")
+    values = sorted({str(x).strip() for x in values if x is not None and str(x).strip()}, key=str.casefold)
+    return {"categories": values}
 
 @router.post("/courses")
 def create_course(data: dict, user=Depends(admin_user)):
@@ -303,10 +334,39 @@ def delete_question(question_id: str, user=Depends(admin_user)):
 
 # Quizzes
 @router.get("/quizzes")
-def quizzes(search: str | None = None, user=Depends(admin_user)):
-    q = {}
-    if search:
-        q = {"$or": [{"title": {"$regex": search, "$options": "i"}}, {"name": {"$regex": search, "$options": "i"}}]}
+def quizzes(
+    search: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    quiz_type: str | None = None,
+    has_questions: str | None = None,
+    user=Depends(admin_user),
+):
+    """Admin quiz list with optional filters. Existing no-argument calls are unchanged."""
+    conditions = []
+    if search and search.strip():
+        value = search.strip()
+        conditions.append({"$or": [
+            {"title": {"$regex": value, "$options": "i"}},
+            {"name": {"$regex": value, "$options": "i"}},
+            {"description": {"$regex": value, "$options": "i"}},
+            {"exam": {"$regex": value, "$options": "i"}},
+        ]})
+    if category and category.lower() != "all":
+        conditions.append({"category": category})
+    if status and status.lower() != "all":
+        conditions.append({"is_published": status.lower() == "published"})
+    if quiz_type and quiz_type.lower() != "all":
+        if quiz_type.lower() == "standalone":
+            conditions.append({"$or": [{"course_id": None}, {"course_id": {"$exists": False}}]})
+        elif quiz_type.lower() == "course":
+            conditions.append({"course_id": {"$nin": [None, ""]}})
+    if has_questions and has_questions.lower() != "all":
+        if has_questions.lower() in ("yes", "ready", "true"):
+            conditions.append({"question_ids.0": {"$exists": True}})
+        elif has_questions.lower() in ("no", "empty", "false"):
+            conditions.append({"$or": [{"question_ids": {"$exists": False}}, {"question_ids": []}]})
+    q = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
     return [clean(x) for x in get_db().quizzes.find(q).sort("created_at", -1)]
 
 @router.post("/quizzes")
