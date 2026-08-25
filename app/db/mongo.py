@@ -39,6 +39,51 @@ def ping():
     return True
 
 
+
+def repair_taxonomy_indexes():
+    """Repair unsafe MongoDB indexes introduced by the category/subcategory migration.
+
+    MongoDB cannot create a multikey compound index containing two array fields.
+    Older migrations attempted to index category_ids + subcategory_ids together,
+    which causes every course/quiz write to fail with error 171.
+    """
+    db = get_db()
+    unsafe = []
+    for collection_name in ("courses", "quizzes", "topics"):
+        collection = db[collection_name]
+        try:
+            indexes = list(collection.list_indexes())
+        except Exception:
+            continue
+        for index in indexes:
+            keys = list((index.get("key") or {}).keys())
+            if "category_ids" in keys and "subcategory_ids" in keys:
+                name = index.get("name")
+                if name and name != "_id_":
+                    try:
+                        collection.drop_index(name)
+                        unsafe.append(f"{collection_name}.{name}")
+                        logger.warning("MONGODB_UNSAFE_TAXONOMY_INDEX_REMOVED | collection=%s | index=%s", collection_name, name)
+                    except Exception:
+                        logger.exception("MONGODB_TAXONOMY_INDEX_REPAIR_FAILED | collection=%s | index=%s", collection_name, name)
+
+    # Safe indexes contain at most one array field. Reuse an existing index
+    # with the same key pattern instead of creating duplicate indexes under a
+    # second name.
+    def ensure_index(collection, keys, name):
+        wanted = list(keys)
+        existing = {tuple((idx.get('key') or {}).items()) for idx in collection.list_indexes()}
+        if tuple(wanted) not in existing:
+            collection.create_index(wanted, name=name)
+
+    ensure_index(db.courses, [('is_published', 1), ('category_ids', 1), ('subject', 1)], 'course_publish_category_subject_idx')
+    ensure_index(db.courses, [('is_published', 1), ('subcategory_ids', 1), ('subject', 1)], 'course_publish_subcategory_subject_idx')
+    ensure_index(db.quizzes, [('is_published', 1), ('category_ids', 1), ('subject', 1)], 'quiz_publish_category_subject_idx')
+    ensure_index(db.quizzes, [('is_published', 1), ('subcategory_ids', 1), ('subject', 1)], 'quiz_publish_subcategory_subject_idx')
+    ensure_index(db.topics, [('course_id', 1), ('is_published', 1), ('category_ids', 1)], 'topic_course_publish_category_idx')
+    ensure_index(db.topics, [('course_id', 1), ('is_published', 1), ('subcategory_ids', 1)], 'topic_course_publish_subcategory_idx')
+    return unsafe
+
 def close():
     global _client
     if _client is not None:

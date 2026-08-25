@@ -62,9 +62,3 @@
 ## E2E limitation
 
 The attached recording demonstrates the deployed Cloudflare Pages application and Cloud Run API. This environment does not have the production admin credentials/database access required to execute destructive production CRUD/upload tests against that deployment. The release therefore includes code-level fixes and static verification, but production smoke tests must be executed after deployment with a real admin/student account.
-
-10. Taxonomy parallel-array MongoDB index regression
-   - Removed the unsafe `is_published + category_ids + subcategory_ids + subject` compound index shape.
-   - Backend startup now repairs an already-deployed database automatically.
-   - Added `MONGO_TAXONOMY_INDEX_REPAIR.js` as a manual fallback.
-   - Added `TAXONOMY_INDEX_FIX_FINAL.md` with deployment details.

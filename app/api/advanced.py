@@ -94,15 +94,74 @@ GAME_DEFS = {
 }
 
 
-def _game_questions(db, count, difficulty=None):
-    q = {'is_published': True}
-    if difficulty: q['difficulty'] = difficulty
-    rows = list(db.questions.find(q).limit(100))
+def _game_questions(db, count, difficulty=None, exclude_ids=None, limit=500):
+    """Return a randomized, diverse question pool for a new game session.
+
+    Game sessions must not repeatedly take the first N MongoDB records. Recent
+    session item ids are excluded first, then the remaining pool is shuffled.
+    If the database has fewer unique questions than a game needs, the oldest
+    questions are allowed back in rather than making the game impossible to start.
+    """
+    exclude_ids = {str(x) for x in (exclude_ids or [])}
+    base = {'is_published': True}
+    if difficulty:
+        base['difficulty'] = difficulty
+
+    rows = list(db.questions.find(base).limit(limit))
     if len(rows) < count:
-        rows = list(db.questions.find({'is_published': True}).limit(200))
-    # Prefer questions with options because the game engine is MCQ-first.
+        rows = list(db.questions.find({'is_published': True}).limit(limit))
+
     rows = [x for x in rows if x.get('question') or x.get('text')]
-    return rows[:count]
+    fresh = [x for x in rows if str(x.get('_id')) not in exclude_ids]
+    import random
+    random.shuffle(fresh)
+
+    if len(fresh) < count:
+        older = [x for x in rows if str(x.get('_id')) in exclude_ids]
+        random.shuffle(older)
+        fresh.extend(older)
+
+    return fresh[:count]
+
+
+def _recent_game_question_ids(db, user_id, slug, sessions=8):
+    """Get question ids used by this learner's recent runs of this game."""
+    recent = list(
+        db.game_sessions.find(
+            {'user_id': user_id, 'slug': slug},
+            {'items': 1, 'completed_at': 1, 'created_at': 1}
+        ).sort([('completed_at', -1), ('created_at', -1)]).limit(sessions)
+    )
+    ids = []
+    for row in recent:
+        for item in row.get('items') or []:
+            item_id = item.get('question_id') or item.get('source_question_id') or item.get('id')
+            if item_id:
+                ids.append(str(item_id))
+    return ids
+
+
+def _question_id(q):
+    return str(q.get('_id'))
+
+
+def _correct_index(q):
+    options = q.get('options') or []
+    value = q.get('correct_answer', q.get('answer'))
+    if isinstance(value, int):
+        return value if 0 <= value < len(options) else None
+    text = str(value or '').strip()
+    if text.isdigit():
+        idx = int(text)
+        return idx if 0 <= idx < len(options) else None
+    if len(text) == 1 and text.upper() in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+        idx = ord(text.upper()) - 65
+        return idx if 0 <= idx < len(options) else None
+    for idx, option in enumerate(options):
+        label = option.get('text') if isinstance(option, dict) else str(option)
+        if str(label).strip().lower() == text.lower():
+            return idx
+    return None
 
 
 def _shuffle(values):
@@ -113,34 +172,51 @@ def _shuffle(values):
 
 
 def _word_from_question(q):
-    # Prefer an explicit learning term if one exists; otherwise derive a
-    # compact answer from the correct option. The answer itself is never sent
-    # to the client until the server grades the submission.
-    term = q.get('term') or q.get('word') or q.get('keyword')
-    if term: return str(term).strip()
+    """Return a single alphabetic learning word suitable for Word Scramble."""
+    candidates = [q.get('term'), q.get('word'), q.get('keyword')]
     options = q.get('options') or []
     idx = q.get('correct_answer', q.get('answer'))
     try:
+        if isinstance(idx, str) and idx.isdigit():
+            idx = int(idx)
         if isinstance(idx, int) and 0 <= idx < len(options):
             opt = options[idx]
-            return str(opt.get('text') if isinstance(opt, dict) else opt).strip()
+            candidates.append(opt.get('text') if isinstance(opt, dict) else opt)
     except Exception:
         pass
-    text = str(q.get('question') or q.get('text') or '').strip()
-    words = re.findall(r'[A-Za-z]{4,}', text)
-    return words[0] if words else 'learning'
+
+    # Only accept one English spelling word. Do not turn an entire question
+    # sentence into a random word; that was the source of poor scramble rounds.
+    blocked = {
+        'which', 'what', 'where', 'when', 'whose', 'there', 'their', 'these',
+        'those', 'answer', 'question', 'correct', 'incorrect', 'option',
+        'true', 'false', 'none', 'both', 'all', 'following', 'select',
+    }
+    for candidate in candidates:
+        raw = str(candidate or "").strip()
+        # A spelling round accepts one ASCII English word only. Phrases such
+        # as "binary tree" and values containing punctuation are rejected.
+        if not re.fullmatch(r"[A-Za-z]{4,18}", raw):
+            continue
+        word = raw.lower()
+        if word not in blocked:
+            return word
+    return None
 
 
 def _scramble(word):
     import random
-    clean_word = re.sub(r'[^A-Za-z]', '', word).lower()
-    if len(clean_word) < 4: return clean_word[::-1]
+    clean_word = re.sub(r'[^A-Za-z]', '', str(word or '')).lower()
+    if len(clean_word) < 4:
+        return ''
     chars = list(clean_word)
-    for _ in range(5):
+    for _ in range(30):
         random.shuffle(chars)
         out = ''.join(chars)
-        if out != clean_word: return out
-    return clean_word[::-1]
+        if out != clean_word:
+            return out
+    # Deterministic fallback for words with repeated letters.
+    return clean_word[1:] + clean_word[:1]
 
 
 @router.get('/gamification')
@@ -231,89 +307,98 @@ def gamification(user=Depends(current_user)):
 def start_game(slug:str, data:dict|None=None, user=Depends(current_user)):
     db=get_db(); user_id=uid(user); definition=GAME_DEFS.get(slug)
     if not definition: raise HTTPException(404,'Game not found')
-    import random
+
     count=definition['count']
     game_type=definition['game_type']
+    recent_ids=set(_recent_game_question_ids(db, user_id, slug, sessions=8))
     items=[]
+    answer_keys={}
 
     if game_type == 'flashcard':
-        cards=list(db.flashcards.find({'user_id':user_id}).sort('due_at',1).limit(max(count,20)))
+        # Prefer due cards, but randomize them so a learner does not see the
+        # same first five cards every time.
+        cards=list(db.flashcards.find({'user_id':user_id}).limit(200))
+        import random
+        random.shuffle(cards)
+        cards=cards[:count]
         if not cards:
-            # Fall back to published questions so a new learner can still play.
-            qs=_game_questions(db,count)
+            qs=_game_questions(db, count, exclude_ids=recent_ids)
             for q in qs:
                 opts=q.get('options') or []
-                idx=q.get('correct_answer',q.get('answer'))
+                idx=_correct_index(q)
                 try:
-                    back=opts[int(idx)] if isinstance(idx,(int,str)) and str(idx).isdigit() else q.get('answer','Review this concept')
-                except Exception: back=q.get('answer','Review this concept')
+                    back=opts[idx] if idx is not None and 0 <= idx < len(opts) else q.get('answer','Review this concept')
+                except Exception:
+                    back=q.get('answer','Review this concept')
                 if isinstance(back,dict): back=back.get('text') or back.get('label') or back.get('value')
-                cards.append({'_id':uuid.uuid4().hex,'front':q.get('question') or q.get('text'),'back':back or 'Review this concept'})
-        cards=cards[:count]
-        items=[{'id':str(c.get('_id')),'front':str(c.get('front','')),'back':str(c.get('back',''))} for c in cards]
+                cards.append({'_id':uuid.uuid4().hex,'source_question_id':_question_id(q),'front':q.get('question') or q.get('text'),'back':back or 'Review this concept'})
+        for c in cards[:count]:
+            item_id=str(c.get('_id'))
+            items.append({'id':item_id,'front':str(c.get('front','')),'back':str(c.get('back',''))})
 
     elif game_type == 'word_scramble':
-        qs=_game_questions(db,count)
-        seen=set()
+        # Word Scramble is intentionally vocabulary-only: no sentences,
+        # punctuation, multi-word answers or generic MCQ phrases.
+        qs=_game_questions(db, max(count * 12, 60), exclude_ids=recent_ids, limit=1000)
+        import random
+        random.shuffle(qs)
+        seen_words=set()
         for q in qs:
             word=_word_from_question(q)
-            key=word.lower()
-            if len(key)<3 or key in seen: continue
-            seen.add(key); items.append({'id':str(q.get('_id')),'scrambled':_scramble(word)})
-            if len(items)>=count: break
+            if not word or word in seen_words:
+                continue
+            seen_words.add(word)
+            qid=_question_id(q)
+            items.append({'id':qid,'source_question_id':qid,'scrambled':_scramble(word)})
+            answer_keys[qid]=word
+            if len(items)>=count:
+                break
 
     elif game_type == 'match':
-        qs=_game_questions(db,count)
+        qs=_game_questions(db, max(count * 4, count), exclude_ids=recent_ids)
         for q in qs:
             opts=q.get('options') or []
-            idx=q.get('correct_answer',q.get('answer'))
-            try: idx=int(idx)
-            except Exception: continue
-            if not isinstance(opts,list) or not (0<=idx<len(opts)): continue
+            idx=_correct_index(q)
+            if not isinstance(opts,list) or idx is None or not (0<=idx<len(opts)): continue
             correct=opts[idx]
             if isinstance(correct,dict): correct=correct.get('text') or correct.get('label') or correct.get('value')
-            rights=[]
-            for o in opts:
-                rights.append(o.get('text') if isinstance(o,dict) else str(o))
+            rights=[o.get('text') if isinstance(o,dict) else str(o) for o in opts]
             rights=_shuffle(rights)
-            items.append({'id':str(q.get('_id')),'left':q.get('question') or q.get('text'),'right_options':rights})
+            qid=_question_id(q)
+            items.append({'id':qid,'source_question_id':qid,'left':q.get('question') or q.get('text'),'right_options':rights})
+            answer_keys[qid]=str(correct)
             if len(items)>=count: break
 
     else:
-        qs=_game_questions(db,count)
+        qs=_game_questions(db, max(count * 3, count), exclude_ids=recent_ids)
         for q in qs:
             options=q.get('options') or []
-            normalized=[]
-            for o in options:
-                normalized.append(o.get('text') if isinstance(o,dict) else str(o))
+            normalized=[o.get('text') if isinstance(o,dict) else str(o) for o in options]
             if not normalized: continue
-            item={'id':str(q.get('_id')),'question':q.get('question') or q.get('text'),'options':normalized}
-            items.append(item)
+            qid=_question_id(q)
+            correct_index = _correct_index(q)
+            if correct_index is None:
+                continue
+            items.append({'id':qid,'source_question_id':qid,'question':q.get('question') or q.get('text'),'options':normalized})
+            answer_keys[qid]=str(correct_index)
             if len(items)>=count: break
 
-    if not items: raise HTTPException(404,'Not enough published learning content to start this game.')
+    if len(items) < count and game_type == 'word_scramble':
+        raise HTTPException(404,'Not enough unique English spelling words are available for this game. Add more vocabulary questions.')
+    if not items:
+        raise HTTPException(404,'Not enough published learning content to start this game.')
+
     session_id=uuid.uuid4().hex
-    d={'_id':session_id,'user_id':user_id,'slug':slug,'title':definition['title'],'game_type':game_type,
-       'status':'started','current_index':0,'score':0,'correct_count':0,'wrong_count':0,'xp_earned':0,
-       'items':items,'total':len(items),'time_limit_seconds':definition['time_limit_seconds'],'started_at':now(),
-       'created_at':now()}
-    # Store private answer metadata separately from public session items.
-    if game_type in ('mcq','match','word_scramble'):
-        d['answer_keys']={}
-        for q in _game_questions(db, count):
-            qid=str(q.get('_id'))
-            if game_type=='word_scramble':
-                word=_word_from_question(q); d['answer_keys'][qid]=word.strip().lower()
-            else:
-                expected=q.get('correct_answer',q.get('answer'))
-                if game_type=='match':
-                    opts=q.get('options') or []
-                    try: expected=str(opts[int(expected)].get('text') if isinstance(opts[int(expected)],dict) else opts[int(expected)])
-                    except Exception: expected=str(expected)
-                d['answer_keys'][qid]=str(expected)
+    d={
+        '_id':session_id,'user_id':user_id,'slug':slug,'title':definition['title'],'game_type':game_type,
+        'status':'started','current_index':0,'score':0,'correct_count':0,'wrong_count':0,'xp_earned':0,
+        'items':items,'total':len(items),'time_limit_seconds':definition['time_limit_seconds'],'started_at':now(),
+        'created_at':now(),'answer_keys':answer_keys,
+    }
     db.game_sessions.insert_one(d)
     public={k:d[k] for k in ('_id','slug','title','game_type','current_index','score','total','time_limit_seconds')}
-    public['session_id']=session_id; public['description']=f"{definition['title']} • {len(items)} rounds"
+    public['session_id']=session_id
+    public['description']=f"{definition['title']} • {len(items)} rounds • Fresh questions"
     public['items']=items
     return public
 

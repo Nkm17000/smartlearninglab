@@ -327,7 +327,10 @@ def student_lesson(lesson_id: str, user=Depends(current_user)):
     nav_lessons = list(db.lessons.find(
         {"course_id": course_id, "topic_id": {"$in": topic_ids}, "is_published": True},
         {"_id": 1, "topic_id": 1, "title": 1, "name": 1, "order": 1}
-    ).sort([("topic_id", 1), ("order", 1)])) if topic_ids else []
+    )) if topic_ids else []
+    # MongoDB ObjectId/topic ids are not curriculum order. Always navigate by
+    # the published topic order first, then lesson order within that topic.
+    nav_lessons.sort(key=lambda x: (topic_order.get(str(x.get("topic_id")), 10**9), int(x.get("order", 0) or 0)))
 
     course_lesson_ids = [str(x.get("_id")) for x in nav_lessons]
     completed = set()
@@ -384,7 +387,10 @@ def course_overview(course_id:str,user=Depends(current_user)):
     c=published("courses",course_id); db=get_db()
     modules=[clean(x) for x in db.topics.find({"course_id":course_id,"is_published":True}).sort("order",1)]
     topic_ids=[str(x.get("_id")) for x in modules]
-    lessons=[clean(x) for x in db.lessons.find({"course_id":course_id,"topic_id":{"$in":topic_ids},"is_published":True}).sort([("topic_id",1),("order",1)])]
+    lessons_raw=list(db.lessons.find({"course_id":course_id,"topic_id":{"$in":topic_ids},"is_published":True}))
+    topic_order={str(x.get("_id")): i for i, x in enumerate(modules)}
+    lessons_raw.sort(key=lambda x: (topic_order.get(str(x.get("topic_id")), 10**9), int(x.get("order", 0) or 0)))
+    lessons=[clean(x) for x in lessons_raw]
     quizzes=[clean(x) for x in db.quizzes.find({"course_id":course_id,"is_published":True}).sort("created_at",-1)]
     topic_names={str(x.get("_id")):(x.get("title") or x.get("name") or "Topic") for x in modules}
     lesson_ids=[str(x.get("_id")) for x in lessons]
