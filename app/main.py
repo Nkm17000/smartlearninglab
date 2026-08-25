@@ -11,6 +11,7 @@ from app.api import admin, ai, auth, learning, growth, advanced, features, media
 from app.core.config import get_settings
 from app.core.logging_config import setup_logging, get_logger
 from app.db.mongo import close, ping
+from app.db.indexes import ensure_safe_taxonomy_indexes
 
 setup_logging()
 logger = get_logger("smart_learning_lab.api")
@@ -22,7 +23,8 @@ async def lifespan(app: FastAPI):
     logger.info("APPLICATION_START | version=4.1.0 | environment=%s", "local/default")
     try:
         ping()
-        logger.info("MONGODB_CONNECTED | ping=ok")
+        ensure_safe_taxonomy_indexes()
+        logger.info("MONGODB_CONNECTED | ping=ok | taxonomy_indexes=safe")
     except Exception:
         logger.exception("MONGODB_CONNECTION_FAILED")
         raise

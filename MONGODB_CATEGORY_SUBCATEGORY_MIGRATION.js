@@ -112,18 +112,33 @@ db.quizzes.find({}).forEach(doc=>{
 });
 
 // 4) Indexes.
+// Remove the old invalid compound multikey indexes if this migration was
+// already executed before the parallel-array fix.
+for (const collection of [db.courses, db.quizzes]) {
+  for (const idx of collection.getIndexes()) {
+    const keys = Object.keys(idx.key || {});
+    if (keys.includes("category_ids") && keys.includes("subcategory_ids")) {
+      collection.dropIndex(idx.name);
+    }
+  }
+}
 db.categories.createIndex({slug:1},{unique:true});
 db.subcategories.createIndex({category_id:1,slug:1},{unique:true});
 db.subcategories.createIndex({category_id:1});
 db.courses.createIndex({category_ids:1});
 db.courses.createIndex({subcategory_ids:1});
 db.courses.createIndex({subject:1});
-db.courses.createIndex({is_published:1,category_ids:1,subcategory_ids:1,subject:1});
+// IMPORTANT: category_ids and subcategory_ids are both arrays. MongoDB
+// cannot index both array fields in the same compound index (parallel
+// multikey arrays). Keep each taxonomy array in its own index.
+db.courses.createIndex({is_published:1,category_ids:1,subject:1});
+db.courses.createIndex({is_published:1,subcategory_ids:1,subject:1});
 db.quizzes.createIndex({category_ids:1});
 db.quizzes.createIndex({subcategory_ids:1});
 db.quizzes.createIndex({subject:1});
 db.quizzes.createIndex({quiz_group_key:1});
-db.quizzes.createIndex({is_published:1,category_ids:1,subcategory_ids:1,subject:1});
+db.quizzes.createIndex({is_published:1,category_ids:1,subject:1});
+db.quizzes.createIndex({is_published:1,subcategory_ids:1,subject:1});
 
 print(`Migration complete. Courses updated: ${courseUpdated}; quizzes updated: ${quizUpdated}`);
 print('IMPORTANT: records without a reliable legacy subcategory keep subcategory_ids/subcategories empty; assign their correct subcategory in Admin → Courses/Test Series.');
