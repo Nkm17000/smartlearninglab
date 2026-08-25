@@ -464,6 +464,7 @@ def save_progress(data: dict, user=Depends(current_user)):
     db = get_db()
     db.progress.update_one({"user_id":uid(user),"lesson_id":lesson_id},{"$set":d},upsert=True)
     cache.delete_prefix(f"dashboard:{uid(user)}")
+    cache.delete_prefix(f"study_assistance:{uid(user)}")
     cache.delete_prefix(f"home:{uid(user)}")
     cache.delete_prefix(f"courses:{uid(user)}:")
     cache.delete_prefix(f"personalized:{uid(user)}")
@@ -482,6 +483,7 @@ def complete_lesson(lesson_id: str, user=Depends(current_user)):
     db.progress.update_one({"user_id":uid(user),"lesson_id":lesson_id},{"$set":d},upsert=True)
     db.notifications.insert_one({"_id": uuid.uuid4().hex, "user_id": uid(user), "title": "Lesson completed", "message": "Great job! You completed a lesson.", "read": False, "created_at": datetime.now(timezone.utc)})
     cache.delete_prefix(f"dashboard:{uid(user)}")
+    cache.delete_prefix(f"study_assistance:{uid(user)}")
     cache.delete_prefix(f"home:{uid(user)}")
     cache.delete_prefix(f"courses:{uid(user)}:")
     cache.delete_prefix(f"personalized:{uid(user)}")
@@ -703,17 +705,20 @@ def notes(user=Depends(current_user)):
 def add_note(data:dict,user=Depends(current_user)):
     if not data.get("content"): raise HTTPException(422,"Note content is required")
     d={"_id":uuid.uuid4().hex,"user_id":uid(user),"content":data["content"],"lesson_id":data.get("lesson_id"),"course_id":data.get("course_id"),"created_at":datetime.now(timezone.utc),"updated_at":datetime.now(timezone.utc)}
-    get_db().notes.insert_one(d); cache.delete_prefix(f"notes:{uid(user)}"); return clean(d)
+    get_db().notes.insert_one(d); cache.delete_prefix(f"notes:{uid(user)}")
+    cache.delete_prefix(f"study_assistance:{uid(user)}"); return clean(d)
 
 @router.put("/notes/{note_id}")
 def update_note(note_id:str,data:dict,user=Depends(current_user)):
     x=find_by_id("notes",note_id)
     if not x or x.get("user_id")!=uid(user): raise HTTPException(404,"Note not found")
     d=dict(data); d.pop("_id",None); d["updated_at"]=datetime.now(timezone.utc)
-    get_db().notes.update_one({"_id":x["_id"]},{"$set":d}); cache.delete_prefix(f"notes:{uid(user)}"); return clean(get_db().notes.find_one({"_id":x["_id"]}))
+    get_db().notes.update_one({"_id":x["_id"]},{"$set":d}); cache.delete_prefix(f"notes:{uid(user)}")
+    cache.delete_prefix(f"study_assistance:{uid(user)}"); return clean(get_db().notes.find_one({"_id":x["_id"]}))
 
 @router.delete("/notes/{note_id}")
 def delete_note(note_id:str,user=Depends(current_user)):
     x=find_by_id("notes",note_id)
     if not x or x.get("user_id")!=uid(user): raise HTTPException(404,"Note not found")
-    get_db().notes.delete_one({"_id":x["_id"]}); cache.delete_prefix(f"notes:{uid(user)}"); return {"message":"Note deleted"}
+    get_db().notes.delete_one({"_id":x["_id"]}); cache.delete_prefix(f"notes:{uid(user)}")
+    cache.delete_prefix(f"study_assistance:{uid(user)}"); return {"message":"Note deleted"}

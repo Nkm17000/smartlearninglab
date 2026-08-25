@@ -466,6 +466,7 @@ def add_bookmark(data: dict, user=Depends(current_user)):
     d = {"_id": uuid.uuid4().hex, "user_id": user_id, "item_type": item_type, "item_id": item_id, "title": data.get("title", ""), "created_at": now()}
     db.bookmarks.insert_one(d)
     cache.delete_prefix(f"bookmarks:{user_id}")
+    cache.delete_prefix(f"study_assistance:{user_id}")
     cache.delete_prefix(f"course:overview:{user_id}:")
     return clean(d)
 
@@ -475,6 +476,7 @@ def delete_bookmark(bookmark_id: str, user=Depends(current_user)):
     if not result.deleted_count:
         raise HTTPException(404, "Bookmark not found")
     cache.delete_prefix(f"bookmarks:{uid(user)}")
+    cache.delete_prefix(f"study_assistance:{uid(user)}")
     cache.delete_prefix(f"course:overview:{uid(user)}:")
     return {"message": "Bookmark removed"}
 

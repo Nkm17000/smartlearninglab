@@ -352,7 +352,8 @@ def flashcards(user=Depends(current_user)):
 def create_flashcard(data:dict,user=Depends(current_user)):
     if not data.get('front') or not data.get('back'): raise HTTPException(422,'front and back are required')
     d={'_id':uuid.uuid4().hex,'user_id':uid(user),'front':data['front'],'back':data['back'],'course_id':data.get('course_id'),'ease':2.5,'interval_days':1,'repetitions':0,'due_at':now(),'created_at':now()}
-    get_db().flashcards.insert_one(d); cache.delete_prefix(f"flashcards:{uid(user)}"); return clean(d)
+    get_db().flashcards.insert_one(d); cache.delete_prefix(f"flashcards:{uid(user)}")
+    cache.delete_prefix(f"study_assistance:{uid(user)}"); return clean(d)
 
 @router.delete('/flashcards/{card_id}')
 def delete_flashcard(card_id: str, user=Depends(current_user)):
@@ -375,7 +376,8 @@ def review_flashcard(card_id:str,data:dict,user=Depends(current_user)):
         reps+=1; interval=1 if reps==1 else 6 if reps==2 else max(1,round(interval*ease))
         ease=max(1.3,ease+0.1-(5-quality)*(0.08+(5-quality)*0.02))
     d={'repetitions':reps,'interval_days':interval,'ease':ease,'due_at':now()+timedelta(days=interval),'last_quality':quality,'updated_at':now()}
-    db.flashcards.update_one({'_id':card_id},{'$set':d}); cache.delete_prefix(f"flashcards:{uid(user)}"); return clean(db.flashcards.find_one({'_id':card_id}))
+    db.flashcards.update_one({'_id':card_id},{'$set':d}); cache.delete_prefix(f"flashcards:{uid(user)}")
+    cache.delete_prefix(f"study_assistance:{uid(user)}"); return clean(db.flashcards.find_one({'_id':card_id}))
 
 @router.get('/flashcards/due')
 def due_flashcards(user=Depends(current_user)):

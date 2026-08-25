@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import admin, ai, auth, learning, growth, advanced, features, media, bulk
+from app.api import admin, ai, auth, learning, growth, advanced, features, media, bulk, study_assistance
 from app.core.config import get_settings
 from app.core.logging_config import setup_logging, get_logger
 from app.db.mongo import close, ping
@@ -125,6 +125,7 @@ app.include_router(advanced.router)
 app.include_router(features.router)
 app.include_router(media.router)
 app.include_router(bulk.router)
+app.include_router(study_assistance.router)
 
 
 @app.get("/")

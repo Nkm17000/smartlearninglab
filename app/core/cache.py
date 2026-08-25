@@ -83,6 +83,7 @@ def invalidate_user(user_id: str):
     """Invalidate all short-lived user caches after a mutation."""
     prefixes = (
         f"dashboard:{user_id}",
+        f"study_assistance:{user_id}",
         f"home:{user_id}",
         f"progress:{user_id}",
         f"results:{user_id}",
