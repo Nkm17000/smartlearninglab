@@ -3,7 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.security import admin_user, root_admin_user, hash_password
 from app.db.mongo import get_db
-from app.services.taxonomy import ensure_seed, all_taxonomy, resolve_links, default_links_for_subject, now as taxonomy_now, clean as taxonomy_clean
+from app.services.taxonomy import ensure_seed, all_taxonomy, resolve_links, now as taxonomy_now, clean as taxonomy_clean
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
 COURSE_CATEGORIES = ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','English Spoken','Computer','Other']
@@ -207,10 +207,12 @@ def delete_subcategory(subcategory_id: str, user=Depends(admin_user)):
 
 
 def resolve_admin_links(data, subject):
+    """Resolve category/subcategory only from explicit admin selection.
+
+    Subject is independent metadata; it is never used to infer taxonomy.
+    """
     category_values = data.get("category_ids", data.get("categories", data.get("category")))
     subcategory_values = data.get("subcategory_ids", data.get("subcategories", data.get("subcategory")))
-    if subcategory_values is None and isinstance(data.get("category"), str) and data.get("category", "").strip().casefold() == str(subject).strip().casefold():
-        return default_links_for_subject(subject)
     return resolve_links(data.get("category_ids"), category_values, data.get("subcategory_ids"), subcategory_values)
 
 # Dashboard

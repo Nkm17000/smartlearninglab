@@ -2,18 +2,7 @@
   {
     "title": "English Grammar - Noun",
     "subject": "English",
-    "categories": [
-      "SSC",
-      "Railway",
-      "Banking",
-      "UPSC",
-      "Teaching",
-      "Defence",
-      "State Exams",
-      "General",
-      "English Spoken",
-      "Other"
-    ],
+    "topic": "Noun",
     "description": "10-question practice test",
     "passing_percentage": 60,
     "duration_minutes": 20,
@@ -29,7 +18,7 @@
   {
     "title": "Java - OOP Concepts",
     "subject": "Java",
-    "categories": ["Computer"],
+    "topic": "OOP",
     "description": "Practice test on Java OOP concepts",
     "passing_percentage": 60,
     "duration_minutes": 20,

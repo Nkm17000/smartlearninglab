@@ -5,7 +5,7 @@ from app.core.security import admin_user
 from app.db.mongo import get_db
 from app.api.media import COURSE_CATEGORIES, upload_bytes
 from app.services.pdf_course_importer import build_course_from_pdf
-from app.services.taxonomy import ensure_seed, resolve_links, default_links_for_subject
+from app.services.taxonomy import resolve_links
 
 router = APIRouter(prefix="/api/v1/admin/bulk", tags=["Admin Bulk Content"])
 
@@ -21,36 +21,26 @@ def clean(v):
     except Exception: pass
     return v.isoformat() if hasattr(v,"isoformat") else v
 
-SUBJECT_DEFAULT_CATEGORIES = {
-    "English": ["SSC", "Railway", "Banking", "UPSC", "Teaching", "Defence", "State Exams", "General", "English Spoken", "Other"],
-    "Hindi": ["SSC", "Railway", "Banking", "UPSC", "Teaching", "Defence", "State Exams", "General", "Other"],
-    "Math": ["SSC", "Railway", "Banking", "UPSC", "Teaching", "Defence", "State Exams", "General", "Other"],
-    "Reasoning": ["SSC", "Railway", "Banking", "UPSC", "Teaching", "Defence", "State Exams", "General", "Other"],
-    "Java": ["Computer"], "Python": ["Computer"], "PHP": ["Computer"], "SQL": ["Computer"],
-    "DBMS": ["Computer"], "Computer": ["Computer"], "Operating Systems": ["Computer"],
-    "Networking": ["Computer"], "Web Development": ["Computer"], "Spring Boot": ["Computer"],
-    "Microservices": ["Computer"]
-}
 
-def normalize_categories(value, subject="Other"):
-    if isinstance(value, str):
-        values = [x.strip() for x in value.split(",") if x.strip()]
-    elif isinstance(value, list):
-        values = [str(x).strip() for x in value if str(x).strip()]
-    else:
-        values = []
-    result=[]; seen=set()
-    for category in values:
-        if category not in COURSE_CATEGORIES:
-            raise HTTPException(422, f"Unsupported category '{category}'. Choose one of: {', '.join(COURSE_CATEGORIES)}")
-        if category.casefold() not in seen:
-            seen.add(category.casefold()); result.append(category)
-    if not result:
-        result = list(SUBJECT_DEFAULT_CATEGORIES.get(str(subject or "Other").strip(), ["Other"]))
-    return result
+def resolve_upload_links(payload=None, *, category_ids=None, categories=None, subcategory_ids=None, subcategories=None):
+    """Resolve taxonomy once for an entire bulk upload.
 
-def require_category(category):
-    return normalize_categories(category, "Other")[0]
+    Category/subcategory are upload-level metadata selected by the admin UI.
+    They are intentionally not read from individual quiz documents.
+    """
+    if payload is not None and isinstance(payload, dict):
+        category_ids = payload.get("category_ids", category_ids)
+        categories = payload.get("categories", categories)
+        subcategory_ids = payload.get("subcategory_ids", subcategory_ids)
+        subcategories = payload.get("subcategories", subcategories)
+
+    if not category_ids and not categories:
+        raise HTTPException(422, "Select at least one category in the admin UI before uploading quizzes.")
+    if not subcategory_ids and not subcategories:
+        raise HTTPException(422, "Select at least one subcategory in the admin UI before uploading quizzes.")
+
+    return resolve_links(category_ids, categories, subcategory_ids, subcategories)
+
 
 def validate_questions(questions):
     if not isinstance(questions, list) or not questions:
@@ -127,7 +117,7 @@ def validate_questions(questions):
         })
     return out
 
-def normalize_quiz_documents(payload):
+def normalize_quiz_documents(payload, upload_links=None):
     """Accept one quiz object, a list of quiz objects, or {"quizzes": [...]}.
 
     The important rule for bulk import is one input quiz object == one quiz draft.
@@ -141,6 +131,9 @@ def normalize_quiz_documents(payload):
         documents = [payload]
     else:
         raise HTTPException(422, "Quiz JSON must be one quiz object, an array of quiz objects, or an object containing a 'quizzes' array")
+
+    if upload_links is None:
+        upload_links = resolve_upload_links(payload)
 
     if not documents:
         raise HTTPException(422, "At least one quiz is required")
@@ -188,27 +181,11 @@ def normalize_quiz_documents(payload):
         if not topic and " - " in title:
             topic = title.split(" - ", 1)[1].strip()
 
-        subject = str(document.get("subject") or "").strip()
-        legacy_category = document.get("category")
-        if not subject and isinstance(legacy_category, str) and legacy_category.strip() not in COURSE_CATEGORIES:
-            # Backward compatibility with the old format where category carried the subject.
-            subject = legacy_category.strip()
-        if not subject:
-            subject = "Other"
-        raw_categories = document.get("categories")
-        if raw_categories is None and isinstance(legacy_category, str) and legacy_category.strip() in COURSE_CATEGORIES:
-            raw_categories = legacy_category
-        # New taxonomy is authoritative: category/subcategory names or IDs are
-        # resolved against the admin taxonomy collections.
-        raw_subcategories = document.get("subcategories", document.get("subcategory"))
-        if raw_subcategories is None and raw_categories is None and isinstance(legacy_category, str):
-            # Legacy format: category carried the subject, e.g. {category:"English"}.
-            links = default_links_for_subject(subject)
-        else:
-            links = resolve_links(
-                document.get("category_ids"), raw_categories,
-                document.get("subcategory_ids"), raw_subcategories
-            )
+        subject = str(document.get("subject") or "").strip() or "Other"
+
+        # Taxonomy is upload-level metadata. Every quiz in this request receives
+        # exactly the same category/subcategory selection from the admin UI.
+        links = upload_links
 
         normalized.append({
             "source_index": index,
@@ -230,9 +207,9 @@ def normalize_quiz_documents(payload):
     return normalized
 
 
-def create_quiz_drafts(payload, user):
+def create_quiz_drafts(payload, user, upload_links=None):
     """Validate the complete payload before writing anything to MongoDB."""
-    documents = normalize_quiz_documents(payload)
+    documents = normalize_quiz_documents(payload, upload_links=upload_links)
     db = get_db()
     created = []
 
@@ -306,15 +283,31 @@ def create_quiz_drafts(payload, user):
 
 @router.post("/quiz")
 def bulk_quiz(data: object = Body(...), user=Depends(admin_user)):
+    # The FE sends taxonomy once at the upload level and the backend applies it
+    # to every quiz in the request. Individual quiz category fields are ignored.
     return create_quiz_drafts(data, user)
 
 
 @router.post("/quiz-file")
-async def bulk_quiz_file(file: UploadFile = File(...), user=Depends(admin_user)):
+async def bulk_quiz_file(
+    file: UploadFile = File(...),
+    categories: str = Form(""),
+    subcategories: str = Form(""),
+    category_ids: str = Form(""),
+    subcategory_ids: str = Form(""),
+    user=Depends(admin_user),
+):
     if not file.filename:
         raise HTTPException(422, "JSON file is required")
     if not file.filename.lower().endswith((".json", ".txt")):
         raise HTTPException(422, "Upload a .json file (a .txt file containing valid JSON is also supported)")
+
+    upload_links = resolve_upload_links(
+        category_ids=category_ids,
+        categories=categories,
+        subcategory_ids=subcategory_ids,
+        subcategories=subcategories,
+    )
 
     raw = await file.read()
     if len(raw) > 20 * 1024 * 1024:
@@ -325,7 +318,7 @@ async def bulk_quiz_file(file: UploadFile = File(...), user=Depends(admin_user))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(422, f"Invalid JSON file: {exc}")
 
-    return create_quiz_drafts(payload, user)
+    return create_quiz_drafts(payload, user, upload_links=upload_links)
 
 
 @router.post("/course-pdf")

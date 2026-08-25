@@ -1,52 +1,23 @@
-{
-  "title": "English Grammar - Noun",
-  "category": [
-    "SSC",
-    "Railway",
-    "Banking",
-    "UPSC",
-    "Teaching",
-    "Defence",
-    "State Exams",
-    "General",
-    "English Spoken"
-  ],
-  "subcategory": [
-    "SSC CGL",
-    "SSC CHSL",
-    "SSC CPO",
-    "RRB NTPC",
-    "RRB Group D",
-    "IBPS PO",
-    "IBPS Clerk",
-    "SBI PO",
-    "UPSC Civil Services",
-    "CTET",
-    "TET",
-    "NDA",
-    "CDS",
-    "State PSC",
-    "Spoken English",
-    "General Competitive Exams"
-  ],
-  "subject": "English",
-  "topic": "Noun",
-  "description": "10-question practice test on Nouns",
-  "difficulty": "Advanced",
-  "level": ["CAT", "SSC CGL Mains"],
-  "passing_percentage": 60,
-  "duration_minutes": 20,
-  "questions": [
-    {
-      "question": "Identify the part containing the error: The committee has decided to revise the criterions for selecting candidates.",
-      "options": [
-        "The committee has decided",
-        "to revise the criterions",
-        "for selecting candidates",
-        "for the final interview"
-      ],
-      "correct_answer": 1,
-      "explanation": "Criteria is the plural of criterion; criterions is not the standard plural in this context."
-    }
-  ]
-}
+[
+  {
+    "title": "English Grammar - Noun",
+    "subject": "English",
+    "topic": "Noun",
+    "description": "10-question practice test on Nouns",
+    "passing_percentage": 60,
+    "duration_minutes": 20,
+    "questions": [
+      {
+        "question": "Identify the part containing the error: The committee has decided to revise the criterions for selecting candidates.",
+        "options": [
+          "The committee has decided",
+          "to revise the criterions",
+          "for selecting candidates",
+          "for the final interview"
+        ],
+        "correct_answer": 1,
+        "explanation": "Criteria is the standard plural of criterion."
+      }
+    ]
+  }
+]
