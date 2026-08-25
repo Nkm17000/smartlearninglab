@@ -5,6 +5,7 @@ from app.core.security import current_user
 from app.db.mongo import get_db
 from app.core.cache import (cache, TTL_DASHBOARD, TTL_COURSES, TTL_CATEGORIES,
                             TTL_FEATURED, TTL_COURSE_OVERVIEW, TTL_QUIZZES, TTL_RESULTS, TTL_PROGRESS, TTL_NOTES, TTL_ENROLLMENTS, TTL_LESSON_VIEW, TTL_LEARNING_SUMMARY, invalidate_user)
+from app.services.taxonomy import normalize_category_document, quiz_group_key
 
 router = APIRouter(prefix="/api/v1", tags=["Student Learning"])
 
@@ -213,167 +214,41 @@ def profile(user=Depends(current_user)):
     return {"id": uid(user), "name": user.get("name",""), "email": user.get("email",""), "role": user.get("role","student"), "is_active": user.get("is_active",True)}
 
 @router.get("/courses")
-def courses(search: str | None = None, category: str | None = None, exam: str | None = None, level: str | None = None, language: str | None = None, free_only: bool = True, user=Depends(current_user)):
-    db = get_db(); user_id = uid(user)
-    key = f"courses:{user_id}:{search or ''}:{category or ''}:{exam or ''}:{level or ''}:{language or ''}:{free_only}"
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    q = {"is_published": True}
+def courses(search: str | None = None, category: str | None = None, exam: str | None = None, level: str | None = None, language: str | None = None, free_only: bool = True, subject: str | None = None, user=Depends(current_user)):
+    db=get_db(); user_id=uid(user)
+    key=f"courses:{user_id}:{search or ''}:{category or ''}:{exam or ''}:{level or ''}:{language or ''}:{subject or ''}:{free_only}"
+    cached=cache.get(key)
+    if cached is not None: return cached
+    conditions=[{"is_published":True}]
     if search:
-        q["$or"] = [
-            {"name": {"$regex": search, "$options": "i"}},
-            {"title": {"$regex": search, "$options": "i"}},
-            {"description": {"$regex": search, "$options": "i"}},
-            {"exam": {"$regex": search, "$options": "i"}},
-            {"tags": {"$regex": search, "$options": "i"}},
-        ]
-    if category: q["category"] = {"$regex": category, "$options": "i"}
-    if exam: q["exam"] = {"$regex": exam, "$options": "i"}
-    if level: q["level"] = {"$regex": level, "$options": "i"}
-    if language: q["language"] = {"$regex": language, "$options": "i"}
-
-    enrolled_ids = {str(x.get("course_id")) for x in db.enrollments.find({"user_id": user_id}, {"course_id": 1})}
-    progress_docs = list(db.progress.find({"user_id": user_id}, {"course_id": 1, "lesson_id": 1, "completed": 1}))
-    completed_by_course = {}
+        conditions.append({"$or":[
+            {"name":{"$regex":search,"$options":"i"}}, {"title":{"$regex":search,"$options":"i"}},
+            {"description":{"$regex":search,"$options":"i"}}, {"exam":{"$regex":search,"$options":"i"}},
+            {"tags":{"$regex":search,"$options":"i"}}, {"subject":{"$regex":search,"$options":"i"}}
+        ]})
+    if category: conditions.append({"$or":[{"categories":category},{"category":{"$regex":f"^{category}$","$options":"i"}}]})
+    if exam: conditions.append({"exam":{"$regex":exam,"$options":"i"}})
+    if subject: conditions.append({"subject":{"$regex":f"^{subject}$","$options":"i"}})
+    if level: conditions.append({"level":{"$regex":level,"$options":"i"}})
+    if language: conditions.append({"language":{"$regex":language,"$options":"i"}})
+    if free_only: conditions.append({"$or":[{"is_free":True},{"is_free":{"$exists":False}}]})
+    q=conditions[0] if len(conditions)==1 else {"$and":conditions}
+    enrolled_ids={str(x.get("course_id")) for x in db.enrollments.find({"user_id":user_id},{"course_id":1})}
+    progress_docs=list(db.progress.find({"user_id":user_id},{"course_id":1,"lesson_id":1,"completed":1}))
+    completed_by_course={}
     for x in progress_docs:
-        if x.get("completed"):
-            completed_by_course[str(x.get("course_id"))] = completed_by_course.get(str(x.get("course_id")), 0) + 1
-
-    courses_list = list(db.courses.find(q).sort([("featured", -1), ("created_at", -1)]))
-    ids = [str(x.get("_id")) for x in courses_list]
-    lesson_counts = {str(x["_id"]): x["n"] for x in db.lessons.aggregate([
-        {"$match": {"course_id": {"$in": ids}, "is_published": True}},
-        {"$group": {"_id": "$course_id", "n": {"$sum": 1}}}
-    ])} if ids else {}
-    quiz_counts = {str(x["_id"]): x["n"] for x in db.quizzes.aggregate([
-        {"$match": {"course_id": {"$in": ids}, "is_published": True}},
-        {"$group": {"_id": "$course_id", "n": {"$sum": 1}}}
-    ])} if ids else {}
-    resource_counts = {str(x["_id"]): x["n"] for x in db.course_resources.aggregate([
-        {"$match": {"course_id": {"$in": ids}}},
-        {"$group": {"_id": "$course_id", "n": {"$sum": 1}}}
-    ])} if ids else {}
-
-    items = []
+        if x.get("completed"): completed_by_course[str(x.get("course_id"))]=completed_by_course.get(str(x.get("course_id")),0)+1
+    courses_list=list(db.courses.find(q).sort([("featured",-1),("created_at",-1)]))
+    ids=[str(x.get("_id")) for x in courses_list]
+    lesson_counts={str(x["_id"]):x["n"] for x in db.lessons.aggregate([{"$match":{"course_id":{"$in":ids},"is_published":True}},{"$group":{"_id":"$course_id","n":{"$sum":1}}}])} if ids else {}
+    quiz_counts={str(x["_id"]):x["n"] for x in db.quizzes.aggregate([{"$match":{"course_id":{"$in":ids},"is_published":True}},{"$group":{"_id":"$course_id","n":{"$sum":1}}}])} if ids else {}
+    resource_counts={str(x["_id"]):x["n"] for x in db.course_resources.aggregate([{"$match":{"course_id":{"$in":ids}}},{"$group":{"_id":"$course_id","n":{"$sum":1}}}])} if ids else {}
+    items=[]
     for course in courses_list:
-        cid = str(course.get("_id")); total = lesson_counts.get(cid, 0); completed = completed_by_course.get(cid, 0)
-        item = clean(course)
-        item.update({
-            "is_enrolled": cid in enrolled_ids,
-            "lesson_count": total,
-            "quiz_count": quiz_counts.get(cid, 0),
-            "pdf_count": resource_counts.get(cid, 0),
-            "progress_percentage": round(completed * 100 / total, 2) if total else 0,
-        })
+        cid=str(course.get("_id")); total=lesson_counts.get(cid,0); completed=completed_by_course.get(cid,0)
+        item=clean(normalize_category_document(course)); item.update({"is_enrolled":cid in enrolled_ids,"lesson_count":total,"quiz_count":quiz_counts.get(cid,0),"pdf_count":resource_counts.get(cid,0),"progress_percentage":round(completed*100/total,2) if total else 0})
         items.append(item)
-    cache.set(key, items, TTL_COURSES)
-    return items
-
-@router.get("/catalog/categories")
-def catalog_categories(user=Depends(current_user)):
-    key = "catalog:categories"
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-    db = get_db()
-    result = {
-        "categories": sorted(x for x in db.courses.distinct("category") if x),
-        "exams": sorted(x for x in db.courses.distinct("exam") if x),
-        "levels": sorted(x for x in db.courses.distinct("level") if x),
-    }
-    cache.set(key, result, TTL_CATEGORIES)
-    return result
-
-@router.get("/catalog/featured")
-def catalog_featured(limit:int=Query(8,ge=1,le=30),user=Depends(current_user)):
-    key = f"catalog:featured:{limit}"
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-    db=get_db()
-    result = {
-        "courses": [clean(x) for x in db.courses.find({"is_published":True}).sort([("featured",-1),("created_at",-1)]).limit(limit)],
-        "quizzes": [clean(x) for x in db.quizzes.find({"is_published":True}).sort([("featured",-1),("created_at",-1)]).limit(limit)],
-    }
-    cache.set(key, result, TTL_FEATURED)
-    return result
-
-@router.get("/lessons/{lesson_id}")
-def student_lesson(lesson_id: str, user=Depends(current_user)):
-    """Student lesson payload. One request replaces lesson + resources + course progress + notes + navigation calls."""
-    user_id = uid(user)
-    key = f"lesson_view:{user_id}:{lesson_id}"
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    lesson = published("lessons", lesson_id)
-    db = get_db()
-    course_id = str(lesson.get("course_id"))
-    topic_id = str(lesson.get("topic_id"))
-
-    resources = [clean(x) for x in db.lesson_resources.find(
-        {"lesson_id": lesson_id},
-        {"_id": 1, "title": 1, "url": 1, "type": 1, "duration_seconds": 1, "order": 1}
-    ).sort("order", 1)]
-
-    topic_rows = list(db.topics.find(
-        {"course_id": course_id, "is_published": True}, {"_id": 1, "order": 1}
-    ).sort("order", 1))
-    topic_ids = [str(x.get("_id")) for x in topic_rows]
-    topic_order = {str(x.get("_id")): i for i, x in enumerate(topic_rows)}
-    nav_lessons = list(db.lessons.find(
-        {"course_id": course_id, "topic_id": {"$in": topic_ids}, "is_published": True},
-        {"_id": 1, "topic_id": 1, "title": 1, "name": 1, "order": 1}
-    ).sort([("topic_id", 1), ("order", 1)])) if topic_ids else []
-
-    course_lesson_ids = [str(x.get("_id")) for x in nav_lessons]
-    completed = set()
-    if course_lesson_ids:
-        completed = {
-            str(x.get("lesson_id"))
-            for x in db.progress.find(
-                {"user_id": user_id, "course_id": course_id, "completed": True},
-                {"lesson_id": 1}
-            )
-        }
-
-    total = len(course_lesson_ids)
-    done = len(completed)
-    progress = {
-        "course_id": course_id,
-        "total_lessons": total,
-        "completed_lessons": done,
-        "percentage": round(done * 100 / total, 2) if total else 0,
-    }
-
-    notes = [clean(x) for x in db.notes.find(
-        {"user_id": user_id, "lesson_id": lesson_id},
-        {"_id": 1, "title": 1, "content": 1, "note": 1, "lesson_id": 1, "course_id": 1, "created_at": 1, "updated_at": 1}
-    ).sort("updated_at", -1).limit(1)]
-
-    nav = []
-    for x in nav_lessons:
-        nav.append({
-            "id": str(x.get("_id")),
-            "topic_id": str(x.get("topic_id")),
-            "title": x.get("title") or x.get("name") or "Lesson",
-            "order": x.get("order", 0),
-            "topic_order": topic_order.get(str(x.get("topic_id")), 0),
-            "completed": str(x.get("_id")) in completed,
-        })
-
-    out = clean(lesson)
-    out["resources"] = resources
-    out["progress"] = progress
-    out["note"] = notes[0] if notes else None
-    out["navigation"] = nav
-    out["course_id"] = course_id
-    out["topic_id"] = topic_id
-    cache.set(key, out, TTL_LESSON_VIEW)
-    return out
+    cache.set(key,items,TTL_COURSES); return items
 
 @router.get("/courses/{course_id}/overview")
 def course_overview(course_id:str,user=Depends(current_user)):
@@ -515,21 +390,37 @@ def learning_summary(user=Depends(current_user)):
     return result
 
 @router.get("/quizzes")
-def quizzes(course_id: str|None=None, module_id: str|None=None, user=Depends(current_user)):
-    db=get_db()
-    key=f"quizzes:{course_id or ''}:{module_id or ''}"
+def quizzes(course_id: str|None=None, module_id: str|None=None, category: str|None=None, subject: str|None=None, user=Depends(current_user)):
+    db=get_db(); user_id=uid(user)
+    key=f"quizzes:{user_id}:{course_id or ''}:{module_id or ''}:{category or ''}:{subject or ''}"
     cached=cache.get(key)
-    if cached is not None:
-        return cached
+    if cached is not None: return cached
     q={"is_published":True}
     if course_id: q["course_id"]=course_id
     if module_id: q["module_id"]=module_id
+    if category: q["$or"]=[{"categories":category},{"category":{"$regex":f"^{category}$","$options":"i"}}]
+    if subject: q["subject"]={"$regex":f"^{subject}$","$options":"i"}
+    quizzes_list=list(db.quizzes.find(q).sort("created_at",-1))
+    # Completion is intentionally keyed by subject + quiz title, not exam category.
+    # Therefore an English quiz completed under SSC is also completed under Railway/Banking
+    # when the other copy has the same subject and title.
+    submitted=list(db.test_attempts.find({"user_id":user_id,"status":"submitted"},{"test_id":1,"submitted_at":1,"result":1}))
+    attempted_ids={str(x.get("test_id")) for x in submitted if x.get("test_id") is not None}
+    submitted_quiz_ids=list(attempted_ids)
+    attempted_quizzes=list(db.quizzes.find({"_id":{"$in":submitted_quiz_ids}},{"_id":1,"title":1,"name":1,"subject":1,"quiz_group_key":1})) if submitted_quiz_ids else []
+    completed_keys=set()
+    for x in attempted_quizzes:
+        key_value=x.get("quiz_group_key") or quiz_group_key(x.get("title") or x.get("name"),x.get("subject"))
+        completed_keys.add(key_value)
     items=[]
-    for x in db.quizzes.find(q).sort("created_at",-1):
-        item=clean(x)
+    for x in quizzes_list:
+        item=clean(normalize_category_document(x))
         ids=list(x.get("question_ids",[]) or [])
-        item["question_count"]=len(ids)
-        item["is_ready"]=bool(ids)
+        group_key=x.get("quiz_group_key") or quiz_group_key(x.get("title") or x.get("name"),x.get("subject"))
+        item["question_count"]=len(ids); item["is_ready"]=bool(ids); item["quiz_group_key"]=group_key
+        item["is_completed"]=group_key in completed_keys
+        item["completion_status"]="completed" if item["is_completed"] else "not_started"
+        item["category_list"]=item.get("categories") or ([item.get("category")] if item.get("category") else [])
         items.append(item)
     cache.set(key,items,TTL_QUIZZES)
     return items
@@ -569,7 +460,13 @@ def quiz_bundle(quiz_id: str, user=Depends(current_user)):
     by={str(x.get("_id")):x for x in found}
     questions=[clean(by[i],hide_answers=True) for i in ids if i in by]
     attempts=db.test_attempts.count_documents({"user_id":user_id,"test_id":quiz_id})
-    result={"quiz":clean(qz),"questions":questions,"attempts_used":attempts,"max_attempts":int(qz.get("max_attempts",3) or 3),"can_start":attempts<int(qz.get("max_attempts",3) or 3)}
+    group_key=qz.get("quiz_group_key") or quiz_group_key(qz.get("title") or qz.get("name"),qz.get("subject"))
+    title=qz.get("title") or qz.get("name") or ""
+    subject=qz.get("subject") or "General"
+    related_rows=list(db.quizzes.find({"$or":[{"quiz_group_key":group_key},{"title":title,"subject":subject},{"name":title,"subject":subject}]},{"_id":1}))
+    related_ids=[str(x.get("_id")) for x in related_rows]
+    completed_related=db.test_attempts.find_one({"user_id":user_id,"status":"submitted","test_id":{"$in":related_ids}}) if related_ids else None
+    result={"quiz":clean(normalize_category_document(qz)),"questions":questions,"attempts_used":attempts,"max_attempts":int(qz.get("max_attempts",3) or 3),"can_start":attempts<int(qz.get("max_attempts",3) or 3),"quiz_group_key":group_key,"is_completed":bool(completed_related),"completion_status":"completed" if completed_related else "not_started"}
     cache.set(key,result,60)
     return result
 
@@ -645,7 +542,7 @@ def _enrich_quiz_results(rows, db):
     rows=list(rows)
     quiz_ids={str(x.get("test_id") or x.get("quiz_id") or "") for x in rows}
     quiz_ids.discard("")
-    quizzes={str(q.get("_id")):q for q in db.quizzes.find({"_id":{"$in":list(quiz_ids)}},{"title":1,"name":1,"course_id":1,"category":1})} if quiz_ids else {}
+    quizzes={str(q.get("_id")):q for q in db.quizzes.find({"_id":{"$in":list(quiz_ids)}},{"title":1,"name":1,"course_id":1,"category":1,"categories":1,"subject":1,"quiz_group_key":1})} if quiz_ids else {}
     out=[]
     for row in rows:
         item=clean(row)
@@ -655,6 +552,9 @@ def _enrich_quiz_results(rows, db):
             item["quiz_title"]=qz.get("title") or qz.get("name") or "Quiz"
             item["course_id"]=qz.get("course_id")
             item["category"]=qz.get("category")
+            item["categories"]=qz.get("categories") or ([qz.get("category")] if qz.get("category") else [])
+            item["subject"]=qz.get("subject") or "General"
+            item["quiz_group_key"]=qz.get("quiz_group_key") or quiz_group_key(qz.get("title") or qz.get("name"),qz.get("subject"))
         result=item.get("result") or {}
         if isinstance(result,dict):
             item.setdefault("percentage",result.get("percentage",0))

@@ -5,6 +5,7 @@ from app.core.security import admin_user
 from app.db.mongo import get_db
 from app.api.media import COURSE_CATEGORIES, upload_bytes
 from app.services.pdf_course_importer import build_course_from_pdf
+from app.services.taxonomy import EXAM_CATEGORIES, SUBJECTS, normalize_categories, normalize_subject, quiz_group_key
 
 router = APIRouter(prefix="/api/v1/admin/bulk", tags=["Admin Bulk Content"])
 
@@ -20,21 +21,12 @@ def clean(v):
     except Exception: pass
     return v.isoformat() if hasattr(v,"isoformat") else v
 
-def require_category(category):
-    category = str(category or "General").strip()
-    if category not in COURSE_CATEGORIES:
-        raise HTTPException(422, f"Unsupported course category. Choose one of: {', '.join(COURSE_CATEGORIES)}")
-    return category
-
-def require_quiz_category(category):
-    # Quiz categories are intentionally more flexible than course categories.
-    # A quiz may be tagged as English, Grammar, CAT, Java, Banking, etc.
-    value = str(category or "General").strip()
-    if not value:
-        return "General"
-    if len(value) > 80:
-        raise HTTPException(422, "Quiz category must be 80 characters or fewer")
-    return value
+def require_categories(value, default="General"):
+    categories=normalize_categories(value, default=default)
+    unsupported=[x for x in categories if x not in EXAM_CATEGORIES]
+    if unsupported:
+        raise HTTPException(422, f"Unsupported exam category: {', '.join(unsupported)}. Choose from: {', '.join(EXAM_CATEGORIES)}")
+    return categories
 
 def validate_questions(questions):
     if not isinstance(questions, list) or not questions:
@@ -172,11 +164,25 @@ def normalize_quiz_documents(payload):
         if not topic and " - " in title:
             topic = title.split(" - ", 1)[1].strip()
 
+        raw_category = document.get("categories", document.get("category", "General"))
+        raw_subject = document.get("subject")
+        # Backward compatibility: older quiz JSON used category="English" to mean the subject.
+        # If that value is a known subject and no explicit subject was supplied, keep the upload working.
+        category_values = normalize_categories(raw_category)
+        if (not isinstance(raw_category, (list, tuple)) and str(raw_category or '').strip() and
+            str(raw_category).strip().casefold() not in {x.casefold() for x in EXAM_CATEGORIES} and
+            not raw_subject and str(raw_category).strip().casefold() in {x.casefold() for x in SUBJECTS}):
+            category_values = ["General"]
+            raw_subject = raw_category
+        else:
+            category_values = require_categories(raw_category)
         normalized.append({
             "source_index": index,
             "title": title,
             "description": str(document.get("description", "")).strip(),
-            "category": require_quiz_category(document.get("category", "General")),
+            "categories": category_values,
+            "category": category_values[0],
+            "subject": normalize_subject(raw_subject or "General"),
             "course_id": document.get("course_id"),
             "module_id": document.get("module_id"),
             "topic": topic,
@@ -219,6 +225,9 @@ def create_quiz_drafts(payload, user):
             "max_attempts": document["max_attempts"],
             "question_ids": qids,
             "category": document["category"],
+            "categories": document["categories"],
+            "subject": document["subject"],
+            "quiz_group_key": quiz_group_key(document["title"], document["subject"]),
             "is_published": False,
             "created_at": now(),
             "updated_at": now(),
@@ -280,10 +289,12 @@ async def bulk_quiz_file(file: UploadFile = File(...), user=Depends(admin_user))
 
 
 @router.post("/course-pdf")
-async def bulk_course_pdf(file:UploadFile=File(...),title:str=Form(""),category:str=Form("General"),level:str=Form("Beginner"),language:str=Form("English"),user=Depends(admin_user)):
+async def bulk_course_pdf(file:UploadFile=File(...),title:str=Form(""),category:str=Form("General"),categories:str=Form(""),subject:str=Form("General"),level:str=Form("Beginner"),language:str=Form("English"),user=Depends(admin_user)):
     if not file.filename: raise HTTPException(422,"PDF file is required")
     if not file.filename.lower().endswith(".pdf"): raise HTTPException(422,"Only PDF files are supported")
-    category=require_category(category)
+    category_values=require_categories(categories or category)
+    category=category_values[0]
+    subject=normalize_subject(subject)
     raw=await file.read()
     if len(raw)>100*1024*1024: raise HTTPException(413,"PDF is too large. Maximum supported size is 100 MB.")
 
@@ -307,7 +318,7 @@ async def bulk_course_pdf(file:UploadFile=File(...),title:str=Form(""),category:
     source_pdf_url=f"/api/v1/media/{media_id}"
     course_id=uuid.uuid4().hex
     course_title=(title or generated.get("title") or file.filename).strip()
-    course={"_id":course_id,"name":course_title,"title":course_title,"description":f"Course generated from {file.filename}. The PDF structure is used as the source of truth; no lesson content is invented.","short_description":f"Imported from {file.filename}"[:180],"category":category,"subcategory":"","level":level,"language":language,"is_free":True,"featured":False,"is_published":False,"learning_objectives":[],"prerequisites":[],"estimated_minutes":0,"instructor_name":"Smart Learning Lab","exam":"General","tags":[category.lower()],"rating":0,"students_count":0,"video_count":0,"pdf_count":1,"mock_test_count":0,"source_pdf_name":file.filename,"source_pdf_size":len(raw),"source_pdf_media_id":str(media_id),"source_pdf_storage_key":storage_key,"source_pdf_url":source_pdf_url,"source_pdf_page_count":generated.get("page_count",0),"pdf_import_strategy":generated.get("strategy"),"pdf_import_report":{"toc_pages":generated.get("toc_pages",[]),"source_topic_count":generated.get("source_topic_count",0),"missing_topics":generated.get("missing_topics",0),"lessons_with_content":generated.get("lessons_with_content",0)},"bulk_imported":True,"created_at":now(),"updated_at":now(),"created_by":uid(user)}
+    course={"_id":course_id,"name":course_title,"title":course_title,"description":f"Course generated from {file.filename}. The PDF structure is used as the source of truth; no lesson content is invented.","short_description":f"Imported from {file.filename}"[:180],"category":category,"categories":category_values,"subject":subject,"subcategory":"","level":level,"language":language,"is_free":True,"featured":False,"is_published":False,"learning_objectives":[],"prerequisites":[],"estimated_minutes":0,"instructor_name":"Smart Learning Lab","exam":"General","tags":[x.lower() for x in category_values],"rating":0,"students_count":0,"video_count":0,"pdf_count":1,"mock_test_count":0,"source_pdf_name":file.filename,"source_pdf_size":len(raw),"source_pdf_media_id":str(media_id),"source_pdf_storage_key":storage_key,"source_pdf_url":source_pdf_url,"source_pdf_page_count":generated.get("page_count",0),"pdf_import_strategy":generated.get("strategy"),"pdf_import_report":{"toc_pages":generated.get("toc_pages",[]),"source_topic_count":generated.get("source_topic_count",0),"missing_topics":generated.get("missing_topics",0),"lessons_with_content":generated.get("lessons_with_content",0)},"bulk_imported":True,"created_at":now(),"updated_at":now(),"created_by":uid(user)}
     db.courses.insert_one(course)
     db.course_resources.insert_one({"_id":uuid.uuid4().hex,"course_id":course_id,"title":file.filename,"description":"Original PDF used to generate this course.","url":source_pdf_url,"media_id":str(media_id),"storage":"r2","storage_key":storage_key,"filename":file.filename,"content_type":"application/pdf","type":"pdf","source":"bulk_course_pdf_v2","order":1,"created_at":now(),"created_by":uid(user)})
 
