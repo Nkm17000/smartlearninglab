@@ -309,20 +309,6 @@ def create_quiz(data: dict, user=Depends(admin_user)):
     d.setdefault("is_published", False)
     return create_doc("quizzes", d, True)
 
-@router.get("/quizzes/{quiz_id}")
-def quiz(quiz_id: str, user=Depends(admin_user)):
-    x = find_by_id("quizzes", quiz_id)
-    if not x: raise HTTPException(404, "Quiz not found")
-    return clean(x)
-
-@router.put("/quizzes/{quiz_id}")
-def update_quiz(quiz_id: str, data: dict, user=Depends(admin_user)):
-    return update_doc("quizzes", quiz_id, data)
-
-@router.delete("/quizzes/{quiz_id}")
-def delete_quiz(quiz_id: str, user=Depends(admin_user)):
-    return delete_doc("quizzes", quiz_id)
-
 @router.post("/quizzes/publish-all")
 def publish_all_quizzes(user=Depends(admin_user)):
     """Publish every draft quiz that has valid question references.
@@ -376,6 +362,22 @@ def publish_all_quizzes(user=Depends(admin_user)):
         "skipped_count": len(skipped),
         "skipped": skipped,
     }
+
+
+@router.get("/quizzes/{quiz_id}")
+def quiz(quiz_id: str, user=Depends(admin_user)):
+    x = find_by_id("quizzes", quiz_id)
+    if not x: raise HTTPException(404, "Quiz not found")
+    return clean(x)
+
+@router.put("/quizzes/{quiz_id}")
+def update_quiz(quiz_id: str, data: dict, user=Depends(admin_user)):
+    return update_doc("quizzes", quiz_id, data)
+
+@router.delete("/quizzes/{quiz_id}")
+def delete_quiz(quiz_id: str, user=Depends(admin_user)):
+    return delete_doc("quizzes", quiz_id)
+
 
 @router.post("/quizzes/manual")
 def create_manual_quiz(data: dict, user=Depends(admin_user)):

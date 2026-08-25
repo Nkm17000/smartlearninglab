@@ -595,7 +595,11 @@ def quizzes(
             {"exam": {"$regex": value, "$options": "i"}},
         ]})
     if category and category.lower() != "all":
-        conditions.append({"$or": [{"categories": category}, {"category": category}]})
+        conditions.append({"$or": [{"categories": category}, {"category": category}, {"category_ids": category}]})
+    if subject and subject.lower() != "all":
+        conditions.append({"subject": {"$regex": f"^{subject.strip()}$", "$options": "i"}})
+    if subcategory and subcategory.lower() != "all":
+        conditions.append({"$or": [{"subcategories": subcategory}, {"subcategory": subcategory}, {"subcategory_ids": subcategory}]})
     if status and status.lower() != "all":
         conditions.append({"is_published": status.lower() == "published"})
     if quiz_type and quiz_type.lower() != "all":
@@ -632,65 +636,6 @@ def create_quiz(data: dict, user=Depends(admin_user)):
     d["quiz_group_key"] = (d["subject"] + "|" + d["title"]).casefold().strip()
     d.setdefault("is_published", False)
     return create_doc("quizzes", d, True)
-
-@router.get("/quizzes/{quiz_id}")
-def quiz(quiz_id: str, user=Depends(admin_user)):
-    x = find_by_id("quizzes", quiz_id)
-    if not x: raise HTTPException(404, "Quiz not found")
-    return clean(x)
-
-@router.put("/quizzes/{quiz_id}")
-def update_quiz(quiz_id: str, data: dict, user=Depends(admin_user)):
-    payload = dict(data or {})
-    if any(k in payload for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory")):
-        links = resolve_admin_links(payload, payload.get("subject") or "Other")
-        payload.update(links)
-        payload["category"] = payload["categories"][0]
-        payload["subcategory"] = payload["subcategories"][0]
-    if payload.get("title") or payload.get("name"):
-        title = str(payload.get("title") or payload.get("name")).strip()
-        payload["quiz_group_key"] = (str(payload.get("subject", "Other")) + "|" + title).casefold().strip()
-    return update_doc("quizzes", quiz_id, payload)
-
-@router.delete("/quizzes/{quiz_id}")
-def delete_quiz(quiz_id: str, user=Depends(admin_user)):
-    return delete_doc("quizzes", quiz_id)
-
-@router.post("/quizzes/{quiz_id}/publish")
-def publish_quiz(quiz_id: str, user=Depends(admin_user)):
-    quiz = find_by_id("quizzes", quiz_id)
-    if not quiz:
-        raise HTTPException(404, "Quiz not found")
-
-    question_ids = list(quiz.get("question_ids", []) or [])
-    if not question_ids:
-        raise HTTPException(400, "Add at least one question before publishing the quiz")
-
-    missing = [str(qid) for qid in question_ids if not find_by_id("questions", str(qid))]
-    if missing:
-        raise HTTPException(400, f"Quiz contains missing question(s): {', '.join(missing)}")
-
-    # Publishing the quiz also publishes its attached questions.  Bulk quiz
-    # import intentionally creates questions as drafts so the admin can review
-    # them first.  Once the quiz is explicitly published, those questions must
-    # become visible to students as part of the published quiz.
-    db = get_db()
-    db.questions.update_many(
-        {"_id": {"$in": question_ids}},
-        {"$set": {"is_published": True, "published_at": now()}},
-    )
-    return update_doc("quizzes", quiz_id, {
-        "is_published": True,
-        "published_at": now(),
-    })
-
-@router.post("/quizzes/{quiz_id}/unpublish")
-def unpublish_quiz(quiz_id: str, user=Depends(admin_user)):
-    quiz = find_by_id("quizzes", quiz_id)
-    if not quiz:
-        raise HTTPException(404, "Quiz not found")
-    return update_doc("quizzes", quiz_id, {"is_published": False})
-
 
 @router.post("/quizzes/publish-all")
 def publish_all_quizzes(user=Depends(admin_user)):
@@ -753,6 +698,67 @@ def publish_all_quizzes(user=Depends(admin_user)):
         "skipped_count": len(skipped),
         "skipped": skipped,
     }
+
+
+
+@router.get("/quizzes/{quiz_id}")
+def quiz(quiz_id: str, user=Depends(admin_user)):
+    x = find_by_id("quizzes", quiz_id)
+    if not x: raise HTTPException(404, "Quiz not found")
+    return clean(x)
+
+@router.put("/quizzes/{quiz_id}")
+def update_quiz(quiz_id: str, data: dict, user=Depends(admin_user)):
+    payload = dict(data or {})
+    if any(k in payload for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory")):
+        links = resolve_admin_links(payload, payload.get("subject") or "Other")
+        payload.update(links)
+        payload["category"] = payload["categories"][0]
+        payload["subcategory"] = payload["subcategories"][0]
+    if payload.get("title") or payload.get("name"):
+        title = str(payload.get("title") or payload.get("name")).strip()
+        payload["quiz_group_key"] = (str(payload.get("subject", "Other")) + "|" + title).casefold().strip()
+    return update_doc("quizzes", quiz_id, payload)
+
+@router.delete("/quizzes/{quiz_id}")
+def delete_quiz(quiz_id: str, user=Depends(admin_user)):
+    return delete_doc("quizzes", quiz_id)
+
+@router.post("/quizzes/{quiz_id}/publish")
+def publish_quiz(quiz_id: str, user=Depends(admin_user)):
+    quiz = find_by_id("quizzes", quiz_id)
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+
+    question_ids = list(quiz.get("question_ids", []) or [])
+    if not question_ids:
+        raise HTTPException(400, "Add at least one question before publishing the quiz")
+
+    missing = [str(qid) for qid in question_ids if not find_by_id("questions", str(qid))]
+    if missing:
+        raise HTTPException(400, f"Quiz contains missing question(s): {', '.join(missing)}")
+
+    # Publishing the quiz also publishes its attached questions.  Bulk quiz
+    # import intentionally creates questions as drafts so the admin can review
+    # them first.  Once the quiz is explicitly published, those questions must
+    # become visible to students as part of the published quiz.
+    db = get_db()
+    db.questions.update_many(
+        {"_id": {"$in": question_ids}},
+        {"$set": {"is_published": True, "published_at": now()}},
+    )
+    return update_doc("quizzes", quiz_id, {
+        "is_published": True,
+        "published_at": now(),
+    })
+
+@router.post("/quizzes/{quiz_id}/unpublish")
+def unpublish_quiz(quiz_id: str, user=Depends(admin_user)):
+    quiz = find_by_id("quizzes", quiz_id)
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+    return update_doc("quizzes", quiz_id, {"is_published": False})
+
 
 
 @router.post("/quizzes/manual")
