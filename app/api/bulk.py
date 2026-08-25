@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-import io, uuid
+import io, uuid, json
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from app.core.security import admin_user
 from app.db.mongo import get_db
@@ -111,40 +111,173 @@ def validate_questions(questions):
         })
     return out
 
-@router.post("/quiz")
-def bulk_quiz(data: dict, user=Depends(admin_user)):
-    if not isinstance(data, dict):
-        raise HTTPException(422, "Request body must be a JSON object")
+def normalize_quiz_documents(payload):
+    """Accept one quiz object, a list of quiz objects, or {"quizzes": [...]}.
 
+    The important rule for bulk import is one input quiz object == one quiz draft.
+    Questions inside that object belong only to that quiz.
+    """
+    if isinstance(payload, dict) and isinstance(payload.get("quizzes"), list):
+        documents = payload["quizzes"]
+    elif isinstance(payload, list):
+        documents = payload
+    elif isinstance(payload, dict):
+        documents = [payload]
+    else:
+        raise HTTPException(422, "Quiz JSON must be one quiz object, an array of quiz objects, or an object containing a 'quizzes' array")
+
+    if not documents:
+        raise HTTPException(422, "At least one quiz is required")
+    if len(documents) > 500:
+        raise HTTPException(422, "A single bulk upload can contain at most 500 quizzes")
+
+    normalized = []
+    seen_titles = set()
+    for index, document in enumerate(documents, 1):
+        if not isinstance(document, dict):
+            raise HTTPException(422, f"Quiz {index} must be a JSON object")
+
+        title = str(document.get("title", document.get("name", ""))).strip()
+        if not title:
+            raise HTTPException(422, f"Quiz {index}: title is required")
+        if len(title) > 200:
+            raise HTTPException(422, f"Quiz {index}: title must be 200 characters or fewer")
+
+        duplicate_key = title.casefold()
+        if duplicate_key in seen_titles:
+            raise HTTPException(422, f"Quiz {index}: duplicate quiz title '{title}' in this upload")
+        seen_titles.add(duplicate_key)
+
+        questions = validate_questions(document.get("questions"))
+        try:
+            duration = int(document.get("duration_minutes", max(15, len(questions) * 2)) or 15)
+            passing = int(document.get("passing_percentage", 60) or 60)
+            max_attempts = int(document.get("max_attempts", 3) or 3)
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"Quiz {index}: duration_minutes, passing_percentage and max_attempts must be numbers")
+
+        if duration < 1 or duration > 600:
+            raise HTTPException(422, f"Quiz {index}: duration_minutes must be between 1 and 600")
+        if passing < 0 or passing > 100:
+            raise HTTPException(422, f"Quiz {index}: passing_percentage must be between 0 and 100")
+        if max_attempts < 1 or max_attempts > 100:
+            raise HTTPException(422, f"Quiz {index}: max_attempts must be between 1 and 100")
+
+        topic = str(
+            document.get("topic")
+            or document.get("topic_name")
+            or document.get("module")
+            or ""
+        ).strip()
+        if not topic and " - " in title:
+            topic = title.split(" - ", 1)[1].strip()
+
+        normalized.append({
+            "source_index": index,
+            "title": title,
+            "description": str(document.get("description", "")).strip(),
+            "category": require_quiz_category(document.get("category", "General")),
+            "course_id": document.get("course_id"),
+            "module_id": document.get("module_id"),
+            "topic": topic,
+            "duration_minutes": duration,
+            "passing_percentage": passing,
+            "max_attempts": max_attempts,
+            "questions": questions,
+        })
+
+    return normalized
+
+
+def create_quiz_drafts(payload, user):
+    """Validate the complete payload before writing anything to MongoDB."""
+    documents = normalize_quiz_documents(payload)
     db = get_db()
-    questions = validate_questions(data.get("questions"))
-    title = str(data.get("title", "")).strip()
-    if not title:
-        raise HTTPException(422, "Quiz title is required")
-    if len(title) > 200:
-        raise HTTPException(422, "Quiz title must be 200 characters or fewer")
+    created = []
+
+    # All validation is completed above before the first insert. This prevents a
+    # malformed topic 17 from being discovered after topics 1-16 were inserted.
+    for document in documents:
+        qids = []
+        for question in document["questions"]:
+            question["created_at"] = now()
+            question["created_by"] = uid(user)
+            db.questions.insert_one(question)
+            qids.append(question["_id"])
+
+        quiz_id = uuid.uuid4().hex
+        quiz = {
+            "_id": quiz_id,
+            "title": document["title"],
+            "name": document["title"],
+            "description": document["description"],
+            "course_id": document["course_id"],
+            "module_id": document["module_id"],
+            "topic": document["topic"],
+            "duration_minutes": document["duration_minutes"],
+            "passing_percentage": document["passing_percentage"],
+            "max_attempts": document["max_attempts"],
+            "question_ids": qids,
+            "category": document["category"],
+            "is_published": False,
+            "created_at": now(),
+            "updated_at": now(),
+            "created_by": uid(user),
+            "bulk_imported": True,
+        }
+        db.quizzes.insert_one(quiz)
+        created.append({
+            "quiz": clean(quiz),
+            "question_count": len(qids),
+            "source_index": document["source_index"],
+            "topic": document["topic"],
+        })
+
+    total_questions = sum(x["question_count"] for x in created)
+    if len(created) == 1:
+        return {
+            "quiz": created[0]["quiz"],
+            "quizzes": [created[0]["quiz"]],
+            "created_quizzes": created,
+            "quiz_count": 1,
+            "question_count": total_questions,
+            "total_question_count": total_questions,
+            "message": "1 quiz draft created. Review it in Test Series before publishing.",
+        }
+
+    return {
+        "quizzes": [x["quiz"] for x in created],
+        "created_quizzes": created,
+        "quiz_count": len(created),
+        "question_count": total_questions,
+        "total_question_count": total_questions,
+        "message": f"{len(created)} quiz drafts created — one quiz for each topic in the uploaded JSON. Review them in Test Series before publishing.",
+    }
+
+
+@router.post("/quiz")
+def bulk_quiz(data, user=Depends(admin_user)):
+    return create_quiz_drafts(data, user)
+
+
+@router.post("/quiz-file")
+async def bulk_quiz_file(file: UploadFile = File(...), user=Depends(admin_user)):
+    if not file.filename:
+        raise HTTPException(422, "JSON file is required")
+    if not file.filename.lower().endswith((".json", ".txt")):
+        raise HTTPException(422, "Upload a .json file (a .txt file containing valid JSON is also supported)")
+
+    raw = await file.read()
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(413, "Quiz JSON file is too large. Maximum supported size is 20 MB.")
 
     try:
-        duration = int(data.get("duration_minutes", max(15, len(questions) * 2)) or 15)
-        passing = int(data.get("passing_percentage", 60) or 60)
-        max_attempts = int(data.get("max_attempts", 3) or 3)
-    except (TypeError, ValueError):
-        raise HTTPException(422, "duration_minutes, passing_percentage and max_attempts must be numbers")
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, f"Invalid JSON file: {exc}")
 
-    if duration < 1 or duration > 600:
-        raise HTTPException(422, "duration_minutes must be between 1 and 600")
-    if passing < 0 or passing > 100:
-        raise HTTPException(422, "passing_percentage must be between 0 and 100")
-    if max_attempts < 1 or max_attempts > 100:
-        raise HTTPException(422, "max_attempts must be between 1 and 100")
+    return create_quiz_drafts(payload, user)
 
-    qids=[]
-    for q in questions:
-        q["created_at"]=now(); q["created_by"]=uid(user); db.questions.insert_one(q); qids.append(q["_id"])
-    quiz_id=uuid.uuid4().hex
-    quiz={"_id":quiz_id,"title":title,"name":title,"description":str(data.get("description","")),"course_id":data.get("course_id"),"module_id":data.get("module_id"),"duration_minutes":duration,"passing_percentage":passing,"max_attempts":max_attempts,"question_ids":qids,"category":require_quiz_category(data.get("category","General")),"is_published":False,"created_at":now(),"updated_at":now(),"created_by":uid(user),"bulk_imported":True}
-    db.quizzes.insert_one(quiz)
-    return {"quiz":clean(quiz),"question_count":len(qids),"message":"Bulk quiz saved as draft. Review and publish it from Test Series."}
 
 @router.post("/course-pdf")
 async def bulk_course_pdf(file:UploadFile=File(...),title:str=Form(""),category:str=Form("General"),level:str=Form("Beginner"),language:str=Form("English"),user=Depends(admin_user)):
