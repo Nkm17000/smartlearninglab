@@ -569,25 +569,61 @@ def quiz_bundle(quiz_id: str, user=Depends(current_user)):
     by={str(x.get("_id")):x for x in found}
     questions=[clean(by[i],hide_answers=True) for i in ids if i in by]
     attempts=db.test_attempts.count_documents({"user_id":user_id,"test_id":quiz_id})
-    result={"quiz":clean(qz),"questions":questions,"attempts_used":attempts,"max_attempts":int(qz.get("max_attempts",3) or 3),"can_start":attempts<int(qz.get("max_attempts",3) or 3)}
+    active=db.test_attempts.find_one({"user_id":user_id,"test_id":quiz_id,"status":"started"}, sort=[("started_at",-1)])
+    result={"quiz":clean(qz),"questions":questions,"attempts_used":attempts,"max_attempts":int(qz.get("max_attempts",3) or 3),"can_start":attempts<int(qz.get("max_attempts",3) or 3),
+            "active_attempt":clean(active) if active else None}
     cache.set(key,result,60)
     return result
 
 @router.post("/quizzes/{quiz_id}/start")
 def start_quiz(quiz_id: str, user=Depends(current_user)):
     qz=published("quizzes",quiz_id); db=get_db(); user_id=uid(user)
+    active=db.test_attempts.find_one({"user_id":user_id,"test_id":quiz_id,"status":"started"}, sort=[("started_at",-1)])
+    if active:
+        return {"attempt_id":str(active["_id"]),"quiz_id":quiz_id,"duration_minutes":qz.get("duration_minutes",15),"resumed":True,
+                "answers":active.get("answers",{}) or {},"current_index":int(active.get("current_index",0) or 0)}
     attempts=db.test_attempts.count_documents({"user_id":user_id,"test_id":quiz_id})
     if attempts>=int(qz.get("max_attempts",3)): raise HTTPException(400,"Maximum attempts reached")
-    a={"_id":uuid.uuid4().hex,"user_id":user_id,"test_id":quiz_id,"status":"started","started_at":datetime.now(timezone.utc)}
+    a={"_id":uuid.uuid4().hex,"user_id":user_id,"test_id":quiz_id,"status":"started","started_at":datetime.now(timezone.utc),"answers":{},"current_index":0,"updated_at":datetime.now(timezone.utc)}
     db.test_attempts.insert_one(a)
     cache.delete_prefix(f"quiz_bundle:{user_id}:{quiz_id}")
     cache.delete_prefix(f"results:{user_id}")
-    return {"attempt_id":a["_id"],"quiz_id":quiz_id,"duration_minutes":qz.get("duration_minutes",15)}
+    return {"attempt_id":a["_id"],"quiz_id":quiz_id,"duration_minutes":qz.get("duration_minutes",15),"resumed":False,"answers":{},"current_index":0}
+
+@router.post("/quizzes/{quiz_id}/attempt/save")
+def save_quiz_attempt(quiz_id: str, data: dict, user=Depends(current_user)):
+    qz=published("quizzes",quiz_id)
+    if not quiz_visible(qz): raise HTTPException(404,"Content not published")
+    db=get_db(); user_id=uid(user)
+    attempt_id=str(data.get("attempt_id") or "")
+    if attempt_id:
+        attempt=db.test_attempts.find_one({"_id":attempt_id,"user_id":user_id,"test_id":quiz_id,"status":"started"})
+    else:
+        attempt=db.test_attempts.find_one({"user_id":user_id,"test_id":quiz_id,"status":"started"}, sort=[("started_at",-1)])
+    if not attempt: raise HTTPException(404,"Active quiz attempt not found")
+    incoming=data.get("answers") or {}
+    answers=dict(attempt.get("answers",{}) or {})
+    answers.update(incoming)
+    current_index=max(0,int(data.get("current_index",attempt.get("current_index",0)) or 0))
+    db.test_attempts.update_one({"_id":attempt["_id"]},{"$set":{"answers":answers,"current_index":current_index,"updated_at":datetime.now(timezone.utc)}})
+    cache.delete_prefix(f"quiz_bundle:{user_id}:{quiz_id}")
+    return {"saved":True,"attempt_id":str(attempt["_id"]),"answers":answers,"current_index":current_index}
 
 @router.post("/quizzes/{quiz_id}/submit")
 def submit_quiz(quiz_id: str, data: dict, user=Depends(current_user)):
     qz=published("quizzes",quiz_id); db=get_db(); user_id=uid(user)
-    answers=data.get("answers",{}) or {}
+    answers=dict(data.get("answers",{}) or {})
+    attempt_id=str(data.get("attempt_id") or "")
+    attempt=None
+    if attempt_id:
+        attempt=db.test_attempts.find_one({"_id":attempt_id,"user_id":user_id,"test_id":quiz_id,"status":"started"})
+    else:
+        attempt=db.test_attempts.find_one({"user_id":user_id,"test_id":quiz_id,"status":"started"}, sort=[("started_at",-1)])
+    if not attempt:
+        raise HTTPException(400,"No active quiz attempt. Please start or resume the quiz.")
+    merged=dict(attempt.get("answers",{}) or {})
+    merged.update(answers)
+    answers=merged
     ids=[str(x) for x in qz.get("question_ids",[])]
     # The quiz is already verified as published above. Grade only the
     # question ids attached to this quiz so bulk-imported questions work
@@ -628,9 +664,7 @@ def submit_quiz(quiz_id: str, data: dict, user=Depends(current_user)):
         })
     pct=round(max(score,0)*100/total,2) if total else 0
     result={"test_id":quiz_id,"score":score,"total":total,"percentage":pct,"passed":pct>=float(qz.get("passing_percentage",60)),"correct_count":correct,"wrong_count":wrong,"details":details}
-    attempt_id=data.get("attempt_id")
-    query={"_id":attempt_id,"user_id":user_id} if attempt_id else {"user_id":user_id,"test_id":quiz_id,"status":"started"}
-    db.test_attempts.update_one(query,{"$set":{"user_id":user_id,"test_id":quiz_id,"status":"submitted","result":result,"submitted_at":datetime.now(timezone.utc)}},upsert=False)
+    db.test_attempts.update_one({"_id":attempt["_id"],"user_id":user_id},{"$set":{"user_id":user_id,"test_id":quiz_id,"status":"submitted","answers":answers,"result":result,"submitted_at":datetime.now(timezone.utc),"updated_at":datetime.now(timezone.utc)}},upsert=False)
     cache.delete_prefix(f"quiz_bundle:{user_id}:{quiz_id}")
     cache.delete_prefix(f"results:{user_id}")
     cache.delete_prefix(f"dashboard:{user_id}")

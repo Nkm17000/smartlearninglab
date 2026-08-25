@@ -136,10 +136,11 @@ def _resource_doc(course_id, lesson_id, title, description, filename, content_ty
     return {'_id':uuid.uuid4().hex,'course_id':course_id,'lesson_id':lesson_id,'title':title.strip() or filename,'description':description.strip(),'url':f'/api/v1/media/{media_id}','media_id':media_id,'storage':'r2','storage_key':key,'filename':filename,'content_type':content_type,'type':kind,'source':'upload','order':order,'created_at':now(),'created_by':uid(user)}
 
 @router.post('/admin/courses/{course_id}/resources/upload')
-def upload_course_resource(course_id:str,file:UploadFile=File(...),title:str='',resource_type:str='',description:str='',user=Depends(admin_user)):
+def upload_course_resource(course_id:str,file:UploadFile|None=File(None),upload:UploadFile|None=File(None),title:str='',resource_type:str='',description:str='',user=Depends(admin_user)):
+    file=file or upload
     course=find('courses',course_id)
     if not course: raise HTTPException(404,'Course not found')
-    if not file.filename: raise HTTPException(422,'File is required')
+    if not file or not file.filename: raise HTTPException(422,'File is required')
     if resource_type and resource_type not in RESOURCE_TYPES: raise HTTPException(422,'Unsupported resource type')
     try: media_id,filename,content_type,inferred,key=upload_file(file,{'owner_type':'course','course_id':course_id,'uploaded_by':uid(user),'type':resource_type or None})
     except RuntimeError as exc: raise HTTPException(503,str(exc))
@@ -173,10 +174,11 @@ def delete_course_resource(course_id:str,resource_id:str,user=Depends(admin_user
     return {'message':'Course resource deleted'}
 
 @router.post('/admin/lessons/{lesson_id}/resources/upload')
-def upload_lesson_resource(lesson_id:str,file:UploadFile=File(...),title:str='',resource_type:str='',description:str='',user=Depends(admin_user)):
+def upload_lesson_resource(lesson_id:str,file:UploadFile|None=File(None),upload:UploadFile|None=File(None),title:str='',resource_type:str='',description:str='',user=Depends(admin_user)):
+    file=file or upload
     lesson=find('lessons',lesson_id)
     if not lesson: raise HTTPException(404,'Lesson not found')
-    if not file.filename: raise HTTPException(422,'File is required')
+    if not file or not file.filename: raise HTTPException(422,'File is required')
     if resource_type and resource_type not in RESOURCE_TYPES: raise HTTPException(422,'Unsupported resource type')
     try: media_id,filename,content_type,inferred,key=upload_file(file,{'owner_type':'lesson','lesson_id':lesson_id,'course_id':lesson.get('course_id'),'uploaded_by':uid(user),'type':resource_type or None})
     except RuntimeError as exc: raise HTTPException(503,str(exc))
@@ -185,8 +187,9 @@ def upload_lesson_resource(lesson_id:str,file:UploadFile=File(...),title:str='',
     db.lesson_resources.insert_one(doc); return clean(doc)
 
 @router.post('/admin/library/upload')
-def upload_library_file(file:UploadFile=File(...),title:str='',category:str='General',description:str='',tags:str='',user=Depends(admin_user)):
-    if not file.filename: raise HTTPException(422,'File is required')
+def upload_library_file(file:UploadFile|None=File(None),upload:UploadFile|None=File(None),title:str='',category:str='General',description:str='',tags:str='',user=Depends(admin_user)):
+    file=file or upload
+    if not file or not file.filename: raise HTTPException(422,'File is required')
     try: media_id,filename,content_type,inferred,key=upload_file(file,{'owner_type':'library','uploaded_by':uid(user),'category':category or 'General'})
     except RuntimeError as exc: raise HTTPException(503,str(exc))
     doc={'_id':uuid.uuid4().hex,'title':title.strip() or filename,'description':description.strip(),'category':category.strip() or 'General','tags':[x.strip() for x in tags.split(',') if x.strip()],'filename':filename,'content_type':content_type,'type':inferred,'media_id':media_id,'storage':'r2','storage_key':key,'url':f'/api/v1/media/{media_id}','is_published':True,'created_at':now(),'created_by':uid(user)}

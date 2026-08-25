@@ -22,6 +22,25 @@ def clean(v):
     return v.isoformat() if hasattr(v,"isoformat") else v
 
 
+def _form_list(value):
+    """Accept JSON-array and comma-separated multipart values."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    text = str(value).strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return [x.strip() for x in text.split(",") if x.strip()]
+
+
 def resolve_upload_links(payload=None, *, category_ids=None, categories=None, subcategory_ids=None, subcategories=None):
     """Resolve taxonomy once for an entire bulk upload.
 
@@ -34,10 +53,15 @@ def resolve_upload_links(payload=None, *, category_ids=None, categories=None, su
         subcategory_ids = payload.get("subcategory_ids", subcategory_ids)
         subcategories = payload.get("subcategories", subcategories)
 
+    category_ids = _form_list(category_ids)
+    categories = _form_list(categories)
+    subcategory_ids = _form_list(subcategory_ids)
+    subcategories = _form_list(subcategories)
+
     if not category_ids and not categories:
-        raise HTTPException(422, "Select at least one category in the admin UI before uploading quizzes.")
+        raise HTTPException(422, "Select at least one category in the admin UI before uploading.")
     if not subcategory_ids and not subcategories:
-        raise HTTPException(422, "Select at least one subcategory in the admin UI before uploading quizzes.")
+        raise HTTPException(422, "Select at least one subcategory in the admin UI before uploading.")
 
     return resolve_links(category_ids, categories, subcategory_ids, subcategories)
 

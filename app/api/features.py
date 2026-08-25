@@ -277,40 +277,69 @@ def personalized_path(user=Depends(current_user)):
     return result
 
 # ---------------- Adaptive Tests ----------------
+@router.get('/adaptive/tests/current')
+def adaptive_current(user=Depends(current_user)):
+    db=get_db(); user_id=uid(user)
+    attempt=db.adaptive_attempts.find_one({'user_id':user_id,'status':'started'}, sort=[('created_at',-1)])
+    if not attempt:
+        return {'active':False}
+    question_ids=[str(x) for x in attempt.get('question_ids',[])]
+    questions=list(db.questions.find({'_id':{'$in':question_ids}}))
+    by={str(q['_id']):q for q in questions}
+    public=[]
+    for qid in question_ids:
+        q=by.get(qid)
+        if not q: continue
+        item=clean(q)
+        item.pop('correct_answer',None); item.pop('answer',None); item.pop('explanation',None)
+        public.append(item)
+    return {'active':True,'test_id':str(attempt['_id']),'adaptive_level':attempt.get('adaptive_level','medium'),'prior_average':attempt.get('prior_average',60),'questions':public,'answers':attempt.get('answers',{}) or {},'current_index':int(attempt.get('current_index',0) or 0),'created_at':attempt.get('created_at')}
+
+@router.post('/adaptive/tests/save')
+def adaptive_save(data:dict,user=Depends(current_user)):
+    db=get_db(); user_id=uid(user); test_id=str(data.get('test_id') or data.get('attempt_id') or '')
+    attempt=db.adaptive_attempts.find_one({'_id':test_id,'user_id':user_id,'status':'started'}) if test_id else db.adaptive_attempts.find_one({'user_id':user_id,'status':'started'},sort=[('created_at',-1)])
+    if not attempt: raise HTTPException(404,'Active mock test not found')
+    answers=dict(attempt.get('answers',{}) or {}); answers.update(data.get('answers') or {})
+    current_index=max(0,int(data.get('current_index',attempt.get('current_index',0)) or 0))
+    db.adaptive_attempts.update_one({'_id':attempt['_id']},{'$set':{'answers':answers,'current_index':current_index,'updated_at':now()}})
+    return {'saved':True,'test_id':str(attempt['_id']),'answers':answers,'current_index':current_index}
+
 @router.post('/adaptive/tests/submit')
 def adaptive_submit(data:dict,user=Depends(current_user)):
     db=get_db(); user_id=uid(user)
-    answers=data.get('answers') or {}
+    answers=dict(data.get('answers') or {})
     test_id=str(data.get('test_id') or data.get('attempt_id') or '')
-
-    # Prefer the server-side adaptive attempt created by /adaptive/tests.
-    # This prevents the client from changing the answer key and fixes the
-    # previous bug where the frontend only received questions with answers
-    # removed, so the backend had nothing reliable to grade.
-    attempt = db.adaptive_attempts.find_one({'_id': test_id, 'user_id': user_id}) if test_id else None
+    attempt=db.adaptive_attempts.find_one({'_id':test_id,'user_id':user_id,'status':'started'}) if test_id else db.adaptive_attempts.find_one({'user_id':user_id,'status':'started'},sort=[('created_at',-1)])
     if not attempt:
-        raise HTTPException(400, 'Mock test session expired. Please start a new test.')
-
+        raise HTTPException(400,'Mock test session expired. Please start a new test.')
+    merged=dict(attempt.get('answers',{}) or {}); merged.update(answers); answers=merged
     question_ids=[str(x) for x in attempt.get('question_ids',[])]
-    questions=list(db.questions.find({'_id': {'$in': question_ids}}))
-    by={str(q['_id']):q for q in questions}
+    questions=list(db.questions.find({'_id': {'$in': question_ids}})); by={str(q['_id']):q for q in questions}
     correct=0; total=len(question_ids); details=[]
     for qid in question_ids:
         q=by.get(qid)
         if not q: continue
-        expected=q.get('correct_answer',q.get('answer'))
-        submitted=answers.get(qid)
-        ok=submitted is not None and str(submitted)==str(expected)
+        expected=q.get('correct_answer',q.get('answer')); submitted=answers.get(qid); ok=submitted is not None and str(submitted)==str(expected)
         if ok: correct+=1
-        details.append({'question_id':qid,'correct':ok,'submitted':submitted})
+        details.append({'question_id':qid,'question':q.get('question',q.get('text','')),'correct':ok,'submitted':submitted,'correct_answer':expected})
     pct=round(correct*100/total,2) if total else 0
-    result={'test_id':test_id,'correct':correct,'total':total,'percentage':pct,'passed':pct>=60,'next_level':'hard' if pct>=80 else 'medium' if pct>=60 else 'easy','details':details}
-    db.adaptive_attempts.update_one({'_id':test_id,'user_id':user_id},{'$set':{'status':'submitted','result':result,'submitted_at':now()}})
+    result={'test_id':str(attempt['_id']),'correct':correct,'total':total,'percentage':pct,'passed':pct>=60,'next_level':'hard' if pct>=80 else 'medium' if pct>=60 else 'easy','details':details}
+    db.adaptive_attempts.update_one({'_id':attempt['_id'],'user_id':user_id},{'$set':{'status':'submitted','answers':answers,'result':result,'submitted_at':now(),'updated_at':now()}})
     return result
 
 @router.post('/adaptive/tests')
 def adaptive_test(data:dict,user=Depends(current_user)):
     db=get_db(); user_id=uid(user); course_id=data.get('course_id'); count=min(30,max(5,int(data.get('count',10) or 10)))
+    active=db.adaptive_attempts.find_one({'user_id':user_id,'status':'started'},sort=[('created_at',-1)])
+    if active:
+        question_ids=[str(x) for x in active.get('question_ids',[])]
+        questions=list(db.questions.find({'_id':{'$in':question_ids}})); by={str(q['_id']):q for q in questions}; public=[]
+        for qid in question_ids:
+            q=by.get(qid)
+            if not q: continue
+            item=clean(q); item.pop('correct_answer',None); item.pop('answer',None); item.pop('explanation',None); public.append(item)
+        return {'test_id':str(active['_id']),'adaptive_level':active.get('adaptive_level','medium'),'prior_average':active.get('prior_average',60),'questions':public,'answers':active.get('answers',{}) or {},'current_index':int(active.get('current_index',0) or 0),'resumed':True}
     attempts=list(db.test_attempts.find({'user_id':user_id,'status':'submitted'}).sort('submitted_at',-1).limit(5))
     avg=sum(float(a.get('result',{}).get('percentage',60)) for a in attempts)/len(attempts) if attempts else 60
     difficulty='hard' if avg>=80 else 'medium' if avg>=60 else 'easy'
@@ -322,21 +351,13 @@ def adaptive_test(data:dict,user=Depends(current_user)):
         if sid not in seen:
             seen.add(sid); chosen.append(q)
         if len(chosen)>=count: break
-    if not chosen:
-        raise HTTPException(404,'No published questions are available for the mock test.')
-
+    if not chosen: raise HTTPException(404,'No published questions are available for the mock test.')
     test_id=uuid.uuid4().hex
-    db.adaptive_attempts.insert_one({
-        '_id':test_id,'user_id':user_id,'status':'started','adaptive_level':difficulty,
-        'prior_average':round(avg,2),'question_ids':[str(q['_id']) for q in chosen],
-        'created_at':now()
-    })
+    db.adaptive_attempts.insert_one({'_id':test_id,'user_id':user_id,'status':'started','adaptive_level':difficulty,'prior_average':round(avg,2),'question_ids':[str(q['_id']) for q in chosen],'answers':{},'current_index':0,'created_at':now(),'updated_at':now()})
     public_questions=[]
     for q in chosen:
-        item=clean(q)
-        item.pop('correct_answer',None); item.pop('answer',None); item.pop('explanation',None)
-        public_questions.append(item)
-    return {'test_id':test_id,'adaptive_level':difficulty,'prior_average':round(avg,2),'questions':public_questions}
+        item=clean(q); item.pop('correct_answer',None); item.pop('answer',None); item.pop('explanation',None); public_questions.append(item)
+    return {'test_id':test_id,'adaptive_level':difficulty,'prior_average':round(avg,2),'questions':public_questions,'answers':{},'current_index':0,'resumed':False}
 
 # ---------------- Flashcards + Spaced Repetition ----------------
 @router.get('/flashcards')

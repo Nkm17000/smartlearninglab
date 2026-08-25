@@ -88,11 +88,29 @@ def all_taxonomy():
 
 
 def _as_list(value):
+    """Normalize taxonomy values from JSON, multipart FormData, or lists.
+
+    Browser multipart clients often send arrays as JSON strings (e.g.
+    '["computer"]'). Older clients send comma-separated strings. Accept both
+    so the API remains backward compatible.
+    """
     if value is None:
         return []
     if isinstance(value, list):
         return [str(x).strip() for x in value if str(x).strip()]
-    return [x.strip() for x in str(value).split(",") if x.strip()]
+    if isinstance(value, tuple):
+        return [str(x).strip() for x in value if str(x).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = __import__("json").loads(text)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+    return [x.strip() for x in text.split(",") if x.strip()]
 
 
 def resolve_links(category_ids=None, categories=None, subcategory_ids=None, subcategories=None):

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.security import admin_user, root_admin_user, hash_password
 from app.db.mongo import get_db
 from app.services.taxonomy import ensure_seed, all_taxonomy, resolve_links, now as taxonomy_now, clean as taxonomy_clean
+from app.core.cache import cache
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
 COURSE_CATEGORIES = ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','English Spoken','Computer','Other']
@@ -87,7 +88,14 @@ def make_doc(data, published=False):
 
 def create_doc(collection, data, published=False):
     d = make_doc(data, published)
-    get_db()[collection].insert_one(d)
+    try:
+        get_db()[collection].insert_one(d)
+    except Exception as exc:
+        # Mongo duplicate-key errors should never become an opaque 500.
+        # Return a useful conflict so the admin can correct the duplicate.
+        if exc.__class__.__name__ == 'DuplicateKeyError':
+            raise HTTPException(409, f"A {collection.rstrip('s')} with the same unique value already exists.") from exc
+        raise
     return clean(d)
 
 def update_doc(collection, item_id, data):
@@ -307,7 +315,17 @@ def create_course(data: dict, user=Depends(admin_user)):
     d.setdefault("short_description", "")
     d.setdefault("level", "Beginner")
     d["subject"] = str(d.get("subject", "Other") or "Other").strip()
-    links = resolve_admin_links(d, d.get("subject"))
+    try:
+        links = resolve_admin_links(d, d.get("subject"))
+    except HTTPException:
+        # Keep direct/admin API clients compatible with older payloads. If a
+        # client omitted taxonomy entirely, derive a safe subject mapping; if
+        # it explicitly supplied an invalid taxonomy value, preserve the 422.
+        supplied = any(d.get(k) for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory"))
+        if supplied:
+            raise
+        from app.services.taxonomy import default_links_for_subject
+        links = default_links_for_subject(d.get("subject"))
     d.update(links)
     d["category"] = d["categories"][0]
     d["subcategory"] = d["subcategories"][0]
@@ -329,7 +347,11 @@ def create_course(data: dict, user=Depends(admin_user)):
     d.setdefault("pdf_count", 0)
     d.setdefault("mock_test_count", 0)
     d.setdefault("is_published", False)
-    return create_doc("courses", d, True)
+    result = create_doc("courses", d, True)
+    cache.delete_prefix("courses:")
+    cache.delete_prefix("dashboard:")
+    cache.delete_prefix("home:")
+    return result
 
 @router.get("/courses/{course_id}")
 def course(course_id: str, user=Depends(admin_user)):
@@ -348,7 +370,11 @@ def update_course(course_id: str, data: dict, user=Depends(admin_user)):
         payload.update(links)
         payload["category"] = payload["categories"][0]
         payload["subcategory"] = payload["subcategories"][0]
-    return update_doc("courses", course_id, payload)
+    result = update_doc("courses", course_id, payload)
+    cache.delete_prefix("courses:")
+    cache.delete_prefix("course:")
+    cache.delete_prefix("home:")
+    return result
 
 @router.delete("/courses/{course_id}")
 def delete_course(course_id: str, user=Depends(admin_user)):
@@ -358,6 +384,10 @@ def delete_course(course_id: str, user=Depends(admin_user)):
     db.courses.delete_one({"_id": find_by_id("courses", course_id)["_id"]})
     db.topics.delete_many({"course_id": course_id})
     db.lessons.delete_many({"course_id": course_id})
+    cache.delete_prefix("courses:")
+    cache.delete_prefix("course:")
+    cache.delete_prefix("quizzes:")
+    cache.delete_prefix("home:")
     return {"message": "Course and its modules/lessons deleted"}
 
 @router.post("/courses/{course_id}/publish")
@@ -629,13 +659,27 @@ def create_quiz(data: dict, user=Depends(admin_user)):
     d.setdefault("max_attempts", 3)
     d.setdefault("question_ids", [])
     d["subject"] = str(d.get("subject", "Other") or "Other").strip()
-    links = resolve_admin_links(d, d.get("subject"))
+    try:
+        links = resolve_admin_links(d, d.get("subject"))
+    except HTTPException:
+        # Keep direct/admin API clients compatible with older payloads. If a
+        # client omitted taxonomy entirely, derive a safe subject mapping; if
+        # it explicitly supplied an invalid taxonomy value, preserve the 422.
+        supplied = any(d.get(k) for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory"))
+        if supplied:
+            raise
+        from app.services.taxonomy import default_links_for_subject
+        links = default_links_for_subject(d.get("subject"))
     d.update(links)
     d["category"] = d["categories"][0]
     d["subcategory"] = d["subcategories"][0]
     d["quiz_group_key"] = (d["subject"] + "|" + d["title"]).casefold().strip()
     d.setdefault("is_published", False)
-    return create_doc("quizzes", d, True)
+    result = create_doc("quizzes", d, True)
+    cache.delete_prefix("quizzes:")
+    cache.delete_prefix("home:")
+    cache.delete_prefix("dashboard:")
+    return result
 
 @router.post("/quizzes/publish-all")
 def publish_all_quizzes(user=Depends(admin_user)):
@@ -718,11 +762,45 @@ def update_quiz(quiz_id: str, data: dict, user=Depends(admin_user)):
     if payload.get("title") or payload.get("name"):
         title = str(payload.get("title") or payload.get("name")).strip()
         payload["quiz_group_key"] = (str(payload.get("subject", "Other")) + "|" + title).casefold().strip()
-    return update_doc("quizzes", quiz_id, payload)
+    result = update_doc("quizzes", quiz_id, payload)
+    cache.delete_prefix("quizzes:")
+    cache.delete_prefix("quiz_bundle:")
+    cache.delete_prefix("home:")
+    return result
 
 @router.delete("/quizzes/{quiz_id}")
 def delete_quiz(quiz_id: str, user=Depends(admin_user)):
-    return delete_doc("quizzes", quiz_id)
+    """Delete a quiz and its private questions/attempts.
+
+    Quiz question records are owned by the quiz when their ids are attached.
+    Removing them prevents orphaned question data and makes the admin Delete
+    action immediately verifiable from the list endpoint.
+    """
+    db = get_db()
+    quiz = find_by_id("quizzes", quiz_id)
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+    actual_id = quiz.get("_id")
+    question_ids = list(quiz.get("question_ids", []) or [])
+    db.quizzes.delete_one({"_id": actual_id})
+    deleted_questions=0
+    for qid in question_ids:
+        # A question may be reused by another quiz. Only remove truly orphaned
+        # question records.
+        shared=db.quizzes.count_documents({"_id":{"$ne":actual_id},"question_ids":qid})
+        if shared==0:
+            deleted_questions += db.questions.delete_one({"_id":qid}).deleted_count
+    db.test_attempts.delete_many({"test_id": quiz_id})
+    try:
+        db.adaptive_attempts.delete_many({"test_id": quiz_id})
+    except Exception:
+        pass
+    cache.delete_prefix("quizzes:")
+    cache.delete_prefix("quiz_bundle:")
+    cache.delete_prefix("results:")
+    cache.delete_prefix("home:")
+    cache.delete_prefix("dashboard:")
+    return {"message": "Quiz deleted", "id": str(actual_id), "deleted_question_count": deleted_questions}
 
 @router.post("/quizzes/{quiz_id}/publish")
 def publish_quiz(quiz_id: str, user=Depends(admin_user)):
@@ -747,17 +825,25 @@ def publish_quiz(quiz_id: str, user=Depends(admin_user)):
         {"_id": {"$in": question_ids}},
         {"$set": {"is_published": True, "published_at": now()}},
     )
-    return update_doc("quizzes", quiz_id, {
+    result = update_doc("quizzes", quiz_id, {
         "is_published": True,
         "published_at": now(),
     })
+    cache.delete_prefix("quizzes:")
+    cache.delete_prefix("quiz_bundle:")
+    cache.delete_prefix("home:")
+    return result
 
 @router.post("/quizzes/{quiz_id}/unpublish")
 def unpublish_quiz(quiz_id: str, user=Depends(admin_user)):
     quiz = find_by_id("quizzes", quiz_id)
     if not quiz:
         raise HTTPException(404, "Quiz not found")
-    return update_doc("quizzes", quiz_id, {"is_published": False})
+    result = update_doc("quizzes", quiz_id, {"is_published": False})
+    cache.delete_prefix("quizzes:")
+    cache.delete_prefix("quiz_bundle:")
+    cache.delete_prefix("home:")
+    return result
 
 
 
@@ -818,7 +904,14 @@ def create_manual_quiz(data: dict, user=Depends(admin_user)):
     # Allow the current FE taxonomy selector to send either category_ids /
     # subcategory_ids or the legacy names. resolve_admin_links enforces the
     # category -> subcategory relationship.
-    links = resolve_admin_links(payload, subject)
+    try:
+        links = resolve_admin_links(payload, subject)
+    except HTTPException:
+        supplied = any(payload.get(k) for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory"))
+        if supplied:
+            raise
+        from app.services.taxonomy import default_links_for_subject
+        links = default_links_for_subject(subject)
 
     db = get_db()
     question_ids = []
@@ -853,6 +946,8 @@ def create_manual_quiz(data: dict, user=Depends(admin_user)):
     result = db.quizzes.insert_one(quiz_doc)
     quiz_doc["_id"] = result.inserted_id
 
+    cache.delete_prefix("quizzes:")
+    cache.delete_prefix("dashboard:")
     return {
         "message": "Quiz created as draft.",
         "quiz": clean(quiz_doc),
