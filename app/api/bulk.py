@@ -86,20 +86,24 @@ def _normalize_bulk_options(q):
     options = q.get("options")
     english = []
     hindi = []
+    bilingual = False
 
     if isinstance(options, dict):
         english = options.get("english") or options.get("en") or []
         hindi = options.get("hindi") or options.get("hi") or []
+        bilingual = any(key in options for key in ("english", "en", "hindi", "hi"))
     elif isinstance(options, list):
         english = options
 
     if isinstance(q.get("options_hindi"), list):
         hindi = q["options_hindi"]
+        bilingual = True
 
     paired = q.get("options_bilingual")
     if isinstance(paired, list) and paired:
         english = [_i18n_text(x, "english") for x in paired]
         hindi = [_i18n_text(x, "hindi") for x in paired]
+        bilingual = True
 
     english = list(english or [])
     hindi = list(hindi or [])
@@ -111,7 +115,7 @@ def _normalize_bulk_options(q):
     if not hindi and english:
         hindi = list(english)
 
-    return [str(x).strip() for x in english], [str(x).strip() for x in hindi]
+    return [str(x).strip() for x in english], [str(x).strip() for x in hindi], bilingual
 
 
 def _resolve_bulk_answer(value, english_options, hindi_options):
@@ -167,11 +171,16 @@ def validate_questions(questions):
         if not english_question and not hindi_question:
             raise HTTPException(422, f"Question {i}: question text is empty")
 
-        english_options, hindi_options = _normalize_bulk_options(q)
+        english_options, hindi_options, options_bilingual = _normalize_bulk_options(q)
+        question_bilingual = isinstance(q.get("question"), dict) or q.get("question_hindi") is not None
+        bilingual = question_bilingual or options_bilingual
+        if len(english_options) != 4:
+            raise HTTPException(422, f"Question {i}: exactly four English options are required")
+        if bilingual and len(hindi_options) != 4:
+            raise HTTPException(422, f"Question {i}: exactly four Hindi options are required for bilingual content")
 
-        if len(english_options) != 4 or len(hindi_options) != 4:
-            raise HTTPException(422, f"Question {i}: exactly four options are required")
-
+        if not bilingual and not hindi_options:
+            hindi_options = list(english_options)
         if any(not x for x in english_options + hindi_options):
             raise HTTPException(422, f"Question {i}: options cannot be empty")
 
