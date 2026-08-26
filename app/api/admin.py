@@ -3,48 +3,8 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.security import admin_user, root_admin_user, hash_password
 from app.db.mongo import get_db
-from app.services.taxonomy import ensure_seed, all_taxonomy, resolve_links, now as taxonomy_now, clean as taxonomy_clean
-from app.core.cache import cache
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
-COURSE_CATEGORIES = ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','English Spoken','Computer','Other']
-SUBJECTS = ['English','Hindi','Math','Reasoning','Aptitude','General Awareness','Current Affairs','Science','Physics','Chemistry','Biology','Java','Python','PHP','SQL','DBMS','Computer','Operating Systems','Networking','Web Development','Spring Boot','Microservices','Other']
-SUBJECT_DEFAULT_CATEGORIES = {
-    'English': ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','English Spoken','Other'],
-    'Hindi': ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Math': ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Reasoning': ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Aptitude': ['SSC','Railway','Banking','Teaching','Defence','State Exams','General','Other'],
-    'General Awareness': ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Current Affairs': ['SSC','Railway','Banking','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Science': ['SSC','Railway','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Physics': ['SSC','Railway','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Chemistry': ['SSC','Railway','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Biology': ['SSC','Railway','UPSC','Teaching','Defence','State Exams','General','Other'],
-    'Java': ['Computer'], 'Python': ['Computer'], 'PHP': ['Computer'], 'SQL': ['Computer'],
-    'DBMS': ['Computer'], 'Computer': ['Computer'], 'Operating Systems': ['Computer'],
-    'Networking': ['Computer'], 'Web Development': ['Computer'], 'Spring Boot': ['Computer'],
-    'Microservices': ['Computer']
-}
-
-def normalize_categories(value, subject=None, fallback='Other'):
-    if isinstance(value, str):
-        values = [x.strip() for x in value.split(',') if x.strip()]
-    elif isinstance(value, list):
-        values = [str(x).strip() for x in value if str(x).strip()]
-    else:
-        values = []
-    result=[]; seen=set()
-    for x in values:
-        if x not in COURSE_CATEGORIES:
-            raise HTTPException(422, f"Unsupported course category: {x}. Choose one of: {', '.join(COURSE_CATEGORIES)}")
-        if x.casefold() not in seen:
-            seen.add(x.casefold()); result.append(x)
-    if not result:
-        mapped = SUBJECT_DEFAULT_CATEGORIES.get(str(subject or '').strip(), [])
-        result = list(mapped) if mapped else [fallback]
-    return result
-
 
 def now():
     return datetime.now(timezone.utc)
@@ -88,14 +48,7 @@ def make_doc(data, published=False):
 
 def create_doc(collection, data, published=False):
     d = make_doc(data, published)
-    try:
-        get_db()[collection].insert_one(d)
-    except Exception as exc:
-        # Mongo duplicate-key errors should never become an opaque 500.
-        # Return a useful conflict so the admin can correct the duplicate.
-        if exc.__class__.__name__ == 'DuplicateKeyError':
-            raise HTTPException(409, f"A {collection.rstrip('s')} with the same unique value already exists.") from exc
-        raise
+    get_db()[collection].insert_one(d)
     return clean(d)
 
 def update_doc(collection, item_id, data):
@@ -115,114 +68,6 @@ def delete_doc(collection, item_id):
     get_db()[collection].delete_one({"_id": old["_id"]})
     return {"message": "Deleted", "id": str(old["_id"])}
 
-
-# Taxonomy: categories and subcategories are first-class admin data.
-@router.get("/taxonomy")
-def taxonomy(user=Depends(admin_user)):
-    return {"categories": all_taxonomy()}
-
-@router.get("/categories")
-def categories(user=Depends(admin_user)):
-    return {"categories": all_taxonomy()}
-
-@router.post("/categories")
-def create_category(data: dict, user=Depends(admin_user)):
-    db = ensure_seed()
-    name = str(data.get("name", "")).strip()
-    if not name:
-        raise HTTPException(422, "Category name is required")
-    from app.services.taxonomy import slug
-    sid = slug(name)
-    if db.categories.find_one({"slug": sid}):
-        raise HTTPException(409, "Category already exists")
-    doc = {"_id": sid, "name": name, "slug": sid, "is_active": True, "created_at": taxonomy_now(), "updated_at": taxonomy_now()}
-    db.categories.insert_one(doc)
-    return taxonomy_clean(doc)
-
-@router.put("/categories/{category_id}")
-def update_category(category_id: str, data: dict, user=Depends(admin_user)):
-    db = ensure_seed()
-    old = db.categories.find_one({"_id": category_id})
-    if not old:
-        raise HTTPException(404, "Category not found")
-    name = str(data.get("name", old.get("name", ""))).strip()
-    if not name:
-        raise HTTPException(422, "Category name is required")
-    from app.services.taxonomy import slug
-    new_slug = slug(name)
-    duplicate = db.categories.find_one({"slug": new_slug, "_id": {"$ne": category_id}})
-    if duplicate:
-        raise HTTPException(409, "Another category already has this name")
-    db.categories.update_one({"_id": category_id}, {"$set": {"name": name, "slug": new_slug, "is_active": bool(data.get("is_active", True)), "updated_at": taxonomy_now()}})
-    return taxonomy_clean(db.categories.find_one({"_id": category_id}))
-
-@router.delete("/categories/{category_id}")
-def delete_category(category_id: str, user=Depends(admin_user)):
-    db = ensure_seed()
-    if not db.categories.find_one({"_id": category_id}):
-        raise HTTPException(404, "Category not found")
-    if db.subcategories.count_documents({"category_id": category_id, "is_active": {"$ne": False}}):
-        raise HTTPException(409, "Remove or deactivate its subcategories before deleting the category")
-    db.categories.update_one({"_id": category_id}, {"$set": {"is_active": False, "updated_at": taxonomy_now()}})
-    return {"message": "Category deactivated"}
-
-@router.get("/categories/{category_id}/subcategories")
-def list_subcategories(category_id: str, user=Depends(admin_user)):
-    db = ensure_seed()
-    if not db.categories.find_one({"_id": category_id}):
-        raise HTTPException(404, "Category not found")
-    return [taxonomy_clean(x) for x in db.subcategories.find({"category_id": category_id, "is_active": {"$ne": False}}).sort("name", 1)]
-
-@router.post("/categories/{category_id}/subcategories")
-def create_subcategory(category_id: str, data: dict, user=Depends(admin_user)):
-    db = ensure_seed()
-    if not db.categories.find_one({"_id": category_id}):
-        raise HTTPException(404, "Category not found")
-    name = str(data.get("name", "")).strip()
-    if not name:
-        raise HTTPException(422, "Subcategory name is required")
-    from app.services.taxonomy import slug
-    sid = f"{category_id}:{slug(name)}"
-    if db.subcategories.find_one({"_id": sid}):
-        raise HTTPException(409, "Subcategory already exists under this category")
-    doc = {"_id": sid, "category_id": category_id, "name": name, "slug": slug(name), "is_active": True, "created_at": taxonomy_now(), "updated_at": taxonomy_now()}
-    db.subcategories.insert_one(doc)
-    return taxonomy_clean(doc)
-
-@router.put("/subcategories/{subcategory_id}")
-def update_subcategory(subcategory_id: str, data: dict, user=Depends(admin_user)):
-    db = ensure_seed()
-    old = db.subcategories.find_one({"_id": subcategory_id})
-    if not old:
-        raise HTTPException(404, "Subcategory not found")
-    name = str(data.get("name", old.get("name", ""))).strip()
-    if not name:
-        raise HTTPException(422, "Subcategory name is required")
-    from app.services.taxonomy import slug
-    duplicate = db.subcategories.find_one({"category_id": old["category_id"], "slug": slug(name), "_id": {"$ne": subcategory_id}})
-    if duplicate:
-        raise HTTPException(409, "Another subcategory already exists under this category")
-    db.subcategories.update_one({"_id": subcategory_id}, {"$set": {"name": name, "slug": slug(name), "is_active": bool(data.get("is_active", True)), "updated_at": taxonomy_now()}})
-    return taxonomy_clean(db.subcategories.find_one({"_id": subcategory_id}))
-
-@router.delete("/subcategories/{subcategory_id}")
-def delete_subcategory(subcategory_id: str, user=Depends(admin_user)):
-    db = ensure_seed()
-    if not db.subcategories.find_one({"_id": subcategory_id}):
-        raise HTTPException(404, "Subcategory not found")
-    db.subcategories.update_one({"_id": subcategory_id}, {"$set": {"is_active": False, "updated_at": taxonomy_now()}})
-    return {"message": "Subcategory deactivated"}
-
-
-def resolve_admin_links(data, subject):
-    """Resolve category/subcategory only from explicit admin selection.
-
-    Subject is independent metadata; it is never used to infer taxonomy.
-    """
-    category_values = data.get("category_ids", data.get("categories", data.get("category")))
-    subcategory_values = data.get("subcategory_ids", data.get("subcategories", data.get("subcategory")))
-    return resolve_links(data.get("category_ids"), category_values, data.get("subcategory_ids"), subcategory_values)
-
 # Dashboard
 @router.get("/dashboard")
 def dashboard(user=Depends(admin_user)):
@@ -240,69 +85,17 @@ def dashboard(user=Depends(admin_user)):
     counts = {"courses": courses, "published_courses": published_courses, "draft_courses": courses-published_courses, "modules": modules, "lessons": lessons, "questions": questions, "quizzes": quizzes, "published_quizzes": published_quizzes, "students": students, "admins": admins, "quiz_attempts": quiz_attempts}
     return {"admin": {"id": str(user["_id"]), "name": user.get("name", "Admin"), "role": user.get("role")}, "counts": counts, **counts}
 
-@router.get("/course-categories")
-def course_categories(user=Depends(admin_user)):
-    return {"categories": COURSE_CATEGORIES, "subjects": SUBJECTS}
-
 # Courses
 @router.get("/courses")
-def courses(
-    search: str | None = None,
-    category: str | None = None,
-    subject: str | None = None,
-    subcategory: str | None = None,
-    status: str | None = None,
-    level: str | None = None,
-    language: str | None = None,
-    user=Depends(admin_user),
-):
-    """Admin course list with optional filters.
-
-    All filters are optional so existing callers remain fully compatible.
-    status accepts: all, published, unpublished (or draft).
-    """
-    conditions = []
-    if search and search.strip():
-        value = search.strip()
-        conditions.append({"$or": [
-            {"name": {"$regex": value, "$options": "i"}},
-            {"title": {"$regex": value, "$options": "i"}},
-            {"description": {"$regex": value, "$options": "i"}},
-            {"short_description": {"$regex": value, "$options": "i"}},
-            {"exam": {"$regex": value, "$options": "i"}},
-            {"subcategory": {"$regex": value, "$options": "i"}},
-            {"subject": {"$regex": value, "$options": "i"}},
-            {"categories": {"$elemMatch": {"$regex": value, "$options": "i"}}},
-        ]})
-    if category and category.lower() != "all":
-        conditions.append({"$or": [{"categories": category}, {"category": category}]})
-    if subject and subject.lower() != "all":
-        conditions.append({"subject": {"$regex": f"^{subject.strip()}$", "$options": "i"}})
-    if subcategory and subcategory.lower() != "all":
-        conditions.append({"$or": [{"subcategories": subcategory}, {"subcategory": subcategory}]})
-    if level and level.lower() != "all":
-        conditions.append({"level": level})
-    if language and language.lower() != "all":
-        conditions.append({"language": language})
-    if subject and subject.lower() != "all":
-        conditions.append({"subject": {"$regex": f"^{subject.strip()}$", "$options": "i"}})
-    if subcategory and subcategory.lower() != "all":
-        conditions.append({"$or": [{"subcategories": subcategory}, {"subcategory": subcategory}]})
-    if status and status.lower() != "all":
-        conditions.append({"is_published": status.lower() == "published"})
-    q = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
+def courses(search: str | None = None, user=Depends(admin_user)):
+    q = {}
+    if search:
+        q = {"$or": [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"title": {"$regex": search, "$options": "i"}},
+            {"description": {"$regex": search, "$options": "i"}},
+        ]}
     return [clean(x) for x in get_db().courses.find(q).sort("created_at", -1)]
-
-@router.get("/quiz-categories")
-def quiz_categories(user=Depends(admin_user)):
-    values = set()
-    for x in get_db().quizzes.distinct("categories"):
-        if isinstance(x, list):
-            values.update(str(v).strip() for v in x if str(v).strip())
-        elif x:
-            values.add(str(x).strip())
-    values.update(str(x).strip() for x in get_db().quizzes.distinct("category") if x)
-    return {"categories": sorted(values, key=str.casefold), "allowed_categories": COURSE_CATEGORIES, "subjects": SUBJECTS}
 
 @router.post("/courses")
 def create_course(data: dict, user=Depends(admin_user)):
@@ -314,22 +107,7 @@ def create_course(data: dict, user=Depends(admin_user)):
     d.setdefault("description", "")
     d.setdefault("short_description", "")
     d.setdefault("level", "Beginner")
-    d["subject"] = str(d.get("subject", "Other") or "Other").strip()
-    try:
-        links = resolve_admin_links(d, d.get("subject"))
-    except HTTPException:
-        # Keep direct/admin API clients compatible with older payloads. If a
-        # client omitted taxonomy entirely, derive a safe subject mapping; if
-        # it explicitly supplied an invalid taxonomy value, preserve the 422.
-        supplied = any(d.get(k) for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory"))
-        if supplied:
-            raise
-        from app.services.taxonomy import default_links_for_subject
-        links = default_links_for_subject(d.get("subject"))
-    d.update(links)
-    d["category"] = d["categories"][0]
-    d["subcategory"] = d["subcategories"][0]
-    d.setdefault("audience", "")
+    d.setdefault("category", "General")
     d.setdefault("language", "English")
     d.setdefault("learning_objectives", [])
     d.setdefault("prerequisites", [])
@@ -347,11 +125,7 @@ def create_course(data: dict, user=Depends(admin_user)):
     d.setdefault("pdf_count", 0)
     d.setdefault("mock_test_count", 0)
     d.setdefault("is_published", False)
-    result = create_doc("courses", d, True)
-    cache.delete_prefix("courses:")
-    cache.delete_prefix("dashboard:")
-    cache.delete_prefix("home:")
-    return result
+    return create_doc("courses", d, True)
 
 @router.get("/courses/{course_id}")
 def course(course_id: str, user=Depends(admin_user)):
@@ -361,20 +135,7 @@ def course(course_id: str, user=Depends(admin_user)):
 
 @router.put("/courses/{course_id}")
 def update_course(course_id: str, data: dict, user=Depends(admin_user)):
-    payload = dict(data or {})
-    subject = str(payload.get("subject", "") or "").strip()
-    if subject:
-        payload["subject"] = subject
-    if any(k in payload for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory")):
-        links = resolve_admin_links(payload, subject or "Other")
-        payload.update(links)
-        payload["category"] = payload["categories"][0]
-        payload["subcategory"] = payload["subcategories"][0]
-    result = update_doc("courses", course_id, payload)
-    cache.delete_prefix("courses:")
-    cache.delete_prefix("course:")
-    cache.delete_prefix("home:")
-    return result
+    return update_doc("courses", course_id, data)
 
 @router.delete("/courses/{course_id}")
 def delete_course(course_id: str, user=Depends(admin_user)):
@@ -384,71 +145,22 @@ def delete_course(course_id: str, user=Depends(admin_user)):
     db.courses.delete_one({"_id": find_by_id("courses", course_id)["_id"]})
     db.topics.delete_many({"course_id": course_id})
     db.lessons.delete_many({"course_id": course_id})
-    cache.delete_prefix("courses:")
-    cache.delete_prefix("course:")
-    cache.delete_prefix("quizzes:")
-    cache.delete_prefix("home:")
     return {"message": "Course and its modules/lessons deleted"}
 
 @router.post("/courses/{course_id}/publish")
 def publish_course(course_id: str, user=Depends(admin_user)):
-    """Publish the complete course tree, including modules, lessons and quizzes."""
-    db = get_db()
     course = find_by_id("courses", course_id)
     if not course:
         raise HTTPException(404, "Course not found")
-
-    db.courses.update_one(
-        {"_id": course["_id"]},
-        {"$set": {"is_published": True, "updated_at": now()}}
-    )
-
-    # Bulk-generated content is initially draft. Once the admin publishes
-    # the course, its children must become visible to students too.
-    course_keys = list({str(x) for x in (course_id, course["_id"])})
-    # Publish topics and quizzes with the course. For PDF imports, only publish
-    # lessons whose detailed source content actually exists. TOC-only entries stay
-    # as admin drafts until a complete PDF or real lesson content is supplied.
-    for collection in ("topics", "quizzes"):
-        db[collection].update_many(
-            {"course_id": {"$in": course_keys}},
-            {"$set": {"is_published": True, "updated_at": now()}}
-        )
-    db.lessons.update_many(
-        {
-            "course_id": {"$in": course_keys},
-            "$or": [
-                {"content_source": {"$ne": "toc_only"}},
-                {"content_source": {"exists": False}},
-            ],
-        },
-        {"$set": {"is_published": True, "updated_at": now()}}
-    )
-
-    return clean(db.courses.find_one({"_id": course["_id"]}))
-
+    db = get_db()
+    lesson_count = db.lessons.count_documents({"course_id": course_id})
+    if lesson_count == 0:
+        raise HTTPException(400, "Add at least one lesson before publishing the course")
+    return update_doc("courses", course_id, {"is_published": True})
 
 @router.post("/courses/{course_id}/unpublish")
 def unpublish_course(course_id: str, user=Depends(admin_user)):
-    """Unpublish the complete course tree."""
-    db = get_db()
-    course = find_by_id("courses", course_id)
-    if not course:
-        raise HTTPException(404, "Course not found")
-
-    db.courses.update_one(
-        {"_id": course["_id"]},
-        {"$set": {"is_published": False, "updated_at": now()}}
-    )
-
-    course_keys = list({str(x) for x in (course_id, course["_id"])})
-    for collection in ("topics", "lessons", "quizzes"):
-        db[collection].update_many(
-            {"course_id": {"$in": course_keys}},
-            {"$set": {"is_published": False, "updated_at": now()}}
-        )
-
-    return clean(db.courses.find_one({"_id": course["_id"]}))
+    return update_doc("courses", course_id, {"is_published": False})
 
 # Modules / topics
 @router.get("/courses/{course_id}/modules")
@@ -468,7 +180,7 @@ def create_module(course_id: str, data: dict, user=Depends(admin_user)):
     d.setdefault("learning_objectives", [])
     d.setdefault("estimated_minutes", 0)
     d.setdefault("order", get_db().topics.count_documents({"course_id": course_id}) + 1)
-    d.setdefault("is_published", False)
+    d.setdefault("is_published", True)
     return create_doc("topics", d, True)
 
 @router.get("/modules/{module_id}")
@@ -480,25 +192,6 @@ def module(module_id: str, user=Depends(admin_user)):
 @router.put("/modules/{module_id}")
 def update_module(module_id: str, data: dict, user=Depends(admin_user)):
     return update_doc("topics", module_id, data)
-
-@router.post("/modules/{module_id}/publish")
-def publish_module(module_id: str, user=Depends(admin_user)):
-    """Publish a topic/module only. Lessons remain independently publishable."""
-    return update_doc("topics", module_id, {"is_published": True})
-
-@router.post("/modules/{module_id}/unpublish")
-def unpublish_module(module_id: str, user=Depends(admin_user)):
-    """Unpublish a topic and its lessons so students cannot access orphaned lessons."""
-    module = find_by_id("topics", module_id)
-    if not module:
-        raise HTTPException(404, "Module not found")
-    result = update_doc("topics", module_id, {"is_published": False})
-    db = get_db()
-    db.lessons.update_many(
-        {"topic_id": module_id},
-        {"$set": {"is_published": False, "updated_at": now()}}
-    )
-    return result
 
 @router.delete("/modules/{module_id}")
 def delete_module(module_id: str, user=Depends(admin_user)):
@@ -529,7 +222,7 @@ def create_lesson(module_id: str, data: dict, user=Depends(admin_user)):
     d.setdefault("order", get_db().lessons.count_documents({"topic_id": module_id}) + 1)
     d.setdefault("duration_minutes", 10)
     d.setdefault("resources", [])
-    d.setdefault("is_published", False)
+    d.setdefault("is_published", True)
     return create_doc("lessons", d, True)
 
 @router.get("/lessons/{lesson_id}")
@@ -542,27 +235,17 @@ def lesson(lesson_id: str, user=Depends(admin_user)):
 def update_lesson(lesson_id: str, data: dict, user=Depends(admin_user)):
     return update_doc("lessons", lesson_id, data)
 
+@router.delete("/lessons/{lesson_id}")
+def delete_lesson(lesson_id: str, user=Depends(admin_user)):
+    return delete_doc("lessons", lesson_id)
+
 @router.post("/lessons/{lesson_id}/publish")
 def publish_lesson(lesson_id: str, user=Depends(admin_user)):
-    """Publish one lesson. The parent course and topic must already be published for students to see it."""
-    lesson = find_by_id("lessons", lesson_id)
-    if not lesson:
-        raise HTTPException(404, "Lesson not found")
-    topic = find_by_id("topics", str(lesson.get("topic_id")))
-    if topic and topic.get("is_published") is False:
-        raise HTTPException(409, "Publish the parent topic before publishing this lesson")
-    course = find_by_id("courses", str(lesson.get("course_id")))
-    if course and course.get("is_published") is False:
-        raise HTTPException(409, "Publish the parent course before publishing this lesson")
     return update_doc("lessons", lesson_id, {"is_published": True})
 
 @router.post("/lessons/{lesson_id}/unpublish")
 def unpublish_lesson(lesson_id: str, user=Depends(admin_user)):
     return update_doc("lessons", lesson_id, {"is_published": False})
-
-@router.delete("/lessons/{lesson_id}")
-def delete_lesson(lesson_id: str, user=Depends(admin_user)):
-    return delete_doc("lessons", lesson_id)
 
 # Questions
 @router.get("/questions")
@@ -604,45 +287,10 @@ def delete_question(question_id: str, user=Depends(admin_user)):
 
 # Quizzes
 @router.get("/quizzes")
-def quizzes(
-    search: str | None = None,
-    category: str | None = None,
-    subject: str | None = None,
-    subcategory: str | None = None,
-    status: str | None = None,
-    quiz_type: str | None = None,
-    has_questions: str | None = None,
-    user=Depends(admin_user),
-):
-    """Admin quiz list with optional filters. Existing no-argument calls are unchanged."""
-    conditions = []
-    if search and search.strip():
-        value = search.strip()
-        conditions.append({"$or": [
-            {"title": {"$regex": value, "$options": "i"}},
-            {"name": {"$regex": value, "$options": "i"}},
-            {"description": {"$regex": value, "$options": "i"}},
-            {"exam": {"$regex": value, "$options": "i"}},
-        ]})
-    if category and category.lower() != "all":
-        conditions.append({"$or": [{"categories": category}, {"category": category}, {"category_ids": category}]})
-    if subject and subject.lower() != "all":
-        conditions.append({"subject": {"$regex": f"^{subject.strip()}$", "$options": "i"}})
-    if subcategory and subcategory.lower() != "all":
-        conditions.append({"$or": [{"subcategories": subcategory}, {"subcategory": subcategory}, {"subcategory_ids": subcategory}]})
-    if status and status.lower() != "all":
-        conditions.append({"is_published": status.lower() == "published"})
-    if quiz_type and quiz_type.lower() != "all":
-        if quiz_type.lower() == "standalone":
-            conditions.append({"$or": [{"course_id": None}, {"course_id": {"$exists": False}}]})
-        elif quiz_type.lower() == "course":
-            conditions.append({"course_id": {"$nin": [None, ""]}})
-    if has_questions and has_questions.lower() != "all":
-        if has_questions.lower() in ("yes", "ready", "true"):
-            conditions.append({"question_ids.0": {"$exists": True}})
-        elif has_questions.lower() in ("no", "empty", "false"):
-            conditions.append({"$or": [{"question_ids": {"$exists": False}}, {"question_ids": []}]})
-    q = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else {}
+def quizzes(search: str | None = None, user=Depends(admin_user)):
+    q = {}
+    if search:
+        q = {"$or": [{"title": {"$regex": search, "$options": "i"}}, {"name": {"$regex": search, "$options": "i"}}]}
     return [clean(x) for x in get_db().quizzes.find(q).sort("created_at", -1)]
 
 @router.post("/quizzes")
@@ -658,92 +306,8 @@ def create_quiz(data: dict, user=Depends(admin_user)):
     d.setdefault("passing_percentage", 60)
     d.setdefault("max_attempts", 3)
     d.setdefault("question_ids", [])
-    d["subject"] = str(d.get("subject", "Other") or "Other").strip()
-    try:
-        links = resolve_admin_links(d, d.get("subject"))
-    except HTTPException:
-        # Keep direct/admin API clients compatible with older payloads. If a
-        # client omitted taxonomy entirely, derive a safe subject mapping; if
-        # it explicitly supplied an invalid taxonomy value, preserve the 422.
-        supplied = any(d.get(k) for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory"))
-        if supplied:
-            raise
-        from app.services.taxonomy import default_links_for_subject
-        links = default_links_for_subject(d.get("subject"))
-    d.update(links)
-    d["category"] = d["categories"][0]
-    d["subcategory"] = d["subcategories"][0]
-    d["quiz_group_key"] = (d["subject"] + "|" + d["title"]).casefold().strip()
     d.setdefault("is_published", False)
-    result = create_doc("quizzes", d, True)
-    cache.delete_prefix("quizzes:")
-    cache.delete_prefix("home:")
-    cache.delete_prefix("dashboard:")
-    return result
-
-@router.post("/quizzes/publish-all")
-def publish_all_quizzes(user=Depends(admin_user)):
-    """Publish every eligible draft quiz.
-
-    A quiz is eligible when it has at least one question and every referenced
-    question exists. Attached questions are published together with the quiz.
-    Invalid/empty quizzes are skipped and reported rather than aborting the
-    entire operation.
-    """
-    db = get_db()
-    drafts = list(db.quizzes.find({"is_published": {"$ne": True}}))
-    published_count = 0
-    skipped = []
-
-    for quiz in drafts:
-        quiz_id = quiz.get("_id")
-        question_ids = list(quiz.get("question_ids", []) or [])
-
-        if not question_ids:
-            skipped.append({
-                "id": str(quiz_id),
-                "title": quiz.get("title") or quiz.get("name") or "Untitled Quiz",
-                "reason": "No questions attached",
-            })
-            continue
-
-        missing = [
-            str(qid)
-            for qid in question_ids
-            if not find_by_id("questions", str(qid))
-        ]
-        if missing:
-            skipped.append({
-                "id": str(quiz_id),
-                "title": quiz.get("title") or quiz.get("name") or "Untitled Quiz",
-                "reason": f"Missing question(s): {', '.join(missing)}",
-            })
-            continue
-
-        # Use a direct update so string/ObjectId IDs in existing data are both
-        # supported by the same list that was validated above.
-        db.questions.update_many(
-            {"_id": {"$in": question_ids}},
-            {"$set": {"is_published": True, "published_at": now()}},
-        )
-        db.quizzes.update_one(
-            {"_id": quiz_id},
-            {"$set": {
-                "is_published": True,
-                "published_at": now(),
-                "updated_at": now(),
-            }},
-        )
-        published_count += 1
-
-    return {
-        "message": f"Published {published_count} quiz(es).",
-        "published_count": published_count,
-        "skipped_count": len(skipped),
-        "skipped": skipped,
-    }
-
-
+    return create_doc("quizzes", d, True)
 
 @router.get("/quizzes/{quiz_id}")
 def quiz(quiz_id: str, user=Depends(admin_user)):
@@ -753,206 +317,19 @@ def quiz(quiz_id: str, user=Depends(admin_user)):
 
 @router.put("/quizzes/{quiz_id}")
 def update_quiz(quiz_id: str, data: dict, user=Depends(admin_user)):
-    payload = dict(data or {})
-    if any(k in payload for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory")):
-        links = resolve_admin_links(payload, payload.get("subject") or "Other")
-        payload.update(links)
-        payload["category"] = payload["categories"][0]
-        payload["subcategory"] = payload["subcategories"][0]
-    if payload.get("title") or payload.get("name"):
-        title = str(payload.get("title") or payload.get("name")).strip()
-        payload["quiz_group_key"] = (str(payload.get("subject", "Other")) + "|" + title).casefold().strip()
-    result = update_doc("quizzes", quiz_id, payload)
-    cache.delete_prefix("quizzes:")
-    cache.delete_prefix("quiz_bundle:")
-    cache.delete_prefix("home:")
-    return result
+    return update_doc("quizzes", quiz_id, data)
 
 @router.delete("/quizzes/{quiz_id}")
 def delete_quiz(quiz_id: str, user=Depends(admin_user)):
-    """Delete a quiz and its private questions/attempts.
-
-    Quiz question records are owned by the quiz when their ids are attached.
-    Removing them prevents orphaned question data and makes the admin Delete
-    action immediately verifiable from the list endpoint.
-    """
-    db = get_db()
-    quiz = find_by_id("quizzes", quiz_id)
-    if not quiz:
-        raise HTTPException(404, "Quiz not found")
-    actual_id = quiz.get("_id")
-    question_ids = list(quiz.get("question_ids", []) or [])
-    db.quizzes.delete_one({"_id": actual_id})
-    deleted_questions=0
-    for qid in question_ids:
-        # A question may be reused by another quiz. Only remove truly orphaned
-        # question records.
-        shared=db.quizzes.count_documents({"_id":{"$ne":actual_id},"question_ids":qid})
-        if shared==0:
-            deleted_questions += db.questions.delete_one({"_id":qid}).deleted_count
-    db.test_attempts.delete_many({"test_id": quiz_id})
-    try:
-        db.adaptive_attempts.delete_many({"test_id": quiz_id})
-    except Exception:
-        pass
-    cache.delete_prefix("quizzes:")
-    cache.delete_prefix("quiz_bundle:")
-    cache.delete_prefix("results:")
-    cache.delete_prefix("home:")
-    cache.delete_prefix("dashboard:")
-    return {"message": "Quiz deleted", "id": str(actual_id), "deleted_question_count": deleted_questions}
+    return delete_doc("quizzes", quiz_id)
 
 @router.post("/quizzes/{quiz_id}/publish")
 def publish_quiz(quiz_id: str, user=Depends(admin_user)):
-    quiz = find_by_id("quizzes", quiz_id)
-    if not quiz:
-        raise HTTPException(404, "Quiz not found")
-
-    question_ids = list(quiz.get("question_ids", []) or [])
-    if not question_ids:
-        raise HTTPException(400, "Add at least one question before publishing the quiz")
-
-    missing = [str(qid) for qid in question_ids if not find_by_id("questions", str(qid))]
-    if missing:
-        raise HTTPException(400, f"Quiz contains missing question(s): {', '.join(missing)}")
-
-    # Publishing the quiz also publishes its attached questions.  Bulk quiz
-    # import intentionally creates questions as drafts so the admin can review
-    # them first.  Once the quiz is explicitly published, those questions must
-    # become visible to students as part of the published quiz.
-    db = get_db()
-    db.questions.update_many(
-        {"_id": {"$in": question_ids}},
-        {"$set": {"is_published": True, "published_at": now()}},
-    )
-    result = update_doc("quizzes", quiz_id, {
-        "is_published": True,
-        "published_at": now(),
-    })
-    cache.delete_prefix("quizzes:")
-    cache.delete_prefix("quiz_bundle:")
-    cache.delete_prefix("home:")
-    return result
+    return update_doc("quizzes", quiz_id, {"is_published": True})
 
 @router.post("/quizzes/{quiz_id}/unpublish")
 def unpublish_quiz(quiz_id: str, user=Depends(admin_user)):
-    quiz = find_by_id("quizzes", quiz_id)
-    if not quiz:
-        raise HTTPException(404, "Quiz not found")
-    result = update_doc("quizzes", quiz_id, {"is_published": False})
-    cache.delete_prefix("quizzes:")
-    cache.delete_prefix("quiz_bundle:")
-    cache.delete_prefix("home:")
-    return result
-
-
-
-@router.post("/quizzes/manual")
-def create_manual_quiz(data: dict, user=Depends(admin_user)):
-    """Create a complete 10-question MCQ quiz as a draft.
-
-    Category/subcategory are upload-level/admin-form metadata and are resolved
-    through the existing taxonomy service. The quiz remains unpublished until
-    the admin explicitly publishes it.
-    """
-    payload = dict(data or {})
-    title = str(payload.get("title") or payload.get("name") or "").strip()
-    subject = str(payload.get("subject") or "Other").strip()
-    topic = str(payload.get("topic") or "").strip()
-    questions = payload.get("questions") or []
-
-    if not title:
-        raise HTTPException(422, "Quiz title is required")
-    if not subject:
-        raise HTTPException(422, "Subject is required")
-    if not topic:
-        raise HTTPException(422, "Topic is required")
-    if len(questions) != 10:
-        raise HTTPException(422, "Manual quiz must contain exactly 10 questions")
-
-    normalized_questions = []
-    for index, item in enumerate(questions, start=1):
-        q = dict(item or {})
-        question_text = str(q.get("question") or "").strip()
-        options = q.get("options") or []
-        if not question_text:
-            raise HTTPException(422, f"Question {index} is required")
-        if not isinstance(options, list) or len(options) != 4:
-            raise HTTPException(422, f"Question {index} must have exactly 4 options")
-        if any(not str(option).strip() for option in options):
-            raise HTTPException(422, f"All four options are required for question {index}")
-
-        try:
-            correct_answer = int(q.get("correct_answer", 0))
-        except (TypeError, ValueError):
-            raise HTTPException(422, f"Invalid correct answer for question {index}")
-        if correct_answer not in (0, 1, 2, 3):
-            raise HTTPException(422, f"Correct answer for question {index} must be 0, 1, 2 or 3")
-
-        normalized_questions.append({
-            "question": question_text,
-            "options": [str(option).strip() for option in options],
-            "correct_answer": correct_answer,
-            "difficulty": str(q.get("difficulty") or "easy").lower(),
-            "marks": float(q.get("marks", 1) or 1),
-            "negative_marks": float(q.get("negative_marks", 0) or 0),
-            "explanation": str(q.get("explanation") or "").strip(),
-            "question_type": "mcq",
-            "is_published": False,
-        })
-
-    # Allow the current FE taxonomy selector to send either category_ids /
-    # subcategory_ids or the legacy names. resolve_admin_links enforces the
-    # category -> subcategory relationship.
-    try:
-        links = resolve_admin_links(payload, subject)
-    except HTTPException:
-        supplied = any(payload.get(k) for k in ("category_ids", "categories", "category", "subcategory_ids", "subcategories", "subcategory"))
-        if supplied:
-            raise
-        from app.services.taxonomy import default_links_for_subject
-        links = default_links_for_subject(subject)
-
-    db = get_db()
-    question_ids = []
-    created_questions = []
-
-    for q in normalized_questions:
-        q["created_at"] = now()
-        q["updated_at"] = now()
-        result = db.questions.insert_one(q)
-        q["_id"] = result.inserted_id
-        question_ids.append(result.inserted_id)
-        created_questions.append(clean(q))
-
-    quiz_doc = {
-        "title": title,
-        "name": title,
-        "subject": subject,
-        "topic": topic,
-        "description": str(payload.get("description") or "").strip(),
-        "exam": str(payload.get("exam") or "").strip(),
-        "duration_minutes": int(payload.get("duration_minutes", 15) or 15),
-        "passing_percentage": int(payload.get("passing_percentage", 60) or 60),
-        "max_attempts": int(payload.get("max_attempts", 3) or 3),
-        "question_ids": question_ids,
-        "is_published": False,
-        "quiz_group_key": f"{subject}|{title}".casefold().strip(),
-        "created_at": now(),
-        "updated_at": now(),
-    }
-    quiz_doc.update(links)
-
-    result = db.quizzes.insert_one(quiz_doc)
-    quiz_doc["_id"] = result.inserted_id
-
-    cache.delete_prefix("quizzes:")
-    cache.delete_prefix("dashboard:")
-    return {
-        "message": "Quiz created as draft.",
-        "quiz": clean(quiz_doc),
-        "questions": created_questions,
-    }
+    return update_doc("quizzes", quiz_id, {"is_published": False})
 
 @router.post("/quizzes/{quiz_id}/questions")
 def add_quiz_questions(quiz_id: str, data: dict, user=Depends(admin_user)):
@@ -992,6 +369,283 @@ def create_question_for_quiz(quiz_id: str, data: dict, user=Depends(admin_user))
     ids.append(q["_id"])
     update_doc("quizzes", quiz_id, {"question_ids": ids})
     return {"question": q, "quiz": clean(find_by_id("quizzes", quiz_id))}
+
+
+# Bulk quiz JSON import
+BULK_QUIZ_BATCH_SIZE = 50
+
+
+def _text_value(value, language="english"):
+    if isinstance(value, dict):
+        preferred = value.get(language)
+        if preferred is not None:
+            return str(preferred).strip()
+        for key in ("english", "en", "hindi", "hi"):
+            if value.get(key) is not None:
+                return str(value[key]).strip()
+        return ""
+    return str(value or "").strip()
+
+
+def _bilingual_value(value):
+    if not isinstance(value, dict):
+        text = str(value or "").strip()
+        return {"english": text, "hindi": text}
+    return {"english": _text_value(value, "english"), "hindi": _text_value(value, "hindi")}
+
+
+def _normalize_options(options, options_hindi=None, options_bilingual=None):
+    """Accept legacy single-language and bilingual option formats.
+
+    Supported input forms:
+      1. "options": ["A", "B", "C", "D"]
+      2. "options": {"english": [...], "hindi": [...]}
+      3. "options": [...], "options_hindi": [...]
+      4. "options_bilingual": [{"english": "...", "hindi": "..."}, ...]
+    """
+    english = []
+    hindi = []
+
+    if isinstance(options, dict):
+        english = list(options.get("english") or options.get("en") or [])
+        hindi = list(options.get("hindi") or options.get("hi") or [])
+    elif isinstance(options, list):
+        english = list(options)
+
+    if isinstance(options_hindi, list):
+        hindi = list(options_hindi)
+
+    if isinstance(options_bilingual, list) and options_bilingual:
+        bilingual_english = []
+        bilingual_hindi = []
+        for item in options_bilingual:
+            if isinstance(item, dict):
+                bilingual_english.append(_text_value(item, "english"))
+                bilingual_hindi.append(_text_value(item, "hindi"))
+            else:
+                bilingual_english.append(str(item or "").strip())
+                bilingual_hindi.append(str(item or "").strip())
+        if bilingual_english:
+            english = bilingual_english
+        if bilingual_hindi:
+            hindi = bilingual_hindi
+
+    return english, hindi
+
+
+def _normalize_correct_answer(value):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    text = str(value or "").strip().upper()
+    mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
+    if text in mapping:
+        return mapping[text]
+    try:
+        return int(text)
+    except Exception:
+        return -1
+
+
+def _normalize_question(raw, question_number):
+    if not isinstance(raw, dict):
+        raise ValueError(f"Question {question_number}: question must be an object")
+    question_value = raw.get("question", "")
+    question_hindi = raw.get("question_hindi")
+    if question_hindi is not None and not isinstance(question_value, dict):
+        question_value = {"english": question_value, "hindi": question_hindi}
+    question_i18n = _bilingual_value(question_value)
+    if not (question_i18n["english"] or question_i18n["hindi"]):
+        raise ValueError(f"Question {question_number}: question is required")
+
+    english_options, hindi_options = _normalize_options(
+        raw.get("options", []),
+        raw.get("options_hindi"),
+        raw.get("options_bilingual"),
+    )
+    if not english_options and not hindi_options:
+        raise ValueError(f"Question {question_number}: options are required")
+    if not english_options:
+        english_options = list(hindi_options)
+    if not hindi_options:
+        hindi_options = list(english_options)
+    if len(english_options) != 4 or len(hindi_options) != 4:
+        raise ValueError(f"Question {question_number}: exactly 4 options are required")
+
+    english_options = [str(x).strip() for x in english_options]
+    hindi_options = [str(x).strip() for x in hindi_options]
+    if any(not x for x in english_options + hindi_options):
+        raise ValueError(f"Question {question_number}: empty option is not allowed")
+
+    def duplicate(values):
+        normalized = [" ".join(v.casefold().split()) for v in values]
+        return len(normalized) != len(set(normalized))
+
+    if duplicate(english_options):
+        raise ValueError(f"Question {question_number}: duplicate English options are not allowed")
+    if duplicate(hindi_options):
+        raise ValueError(f"Question {question_number}: duplicate Hindi options are not allowed")
+
+    correct_answer = _normalize_correct_answer(raw.get("correct_answer", raw.get("answer")))
+    if correct_answer not in (0, 1, 2, 3):
+        raise ValueError(f"Question {question_number}: correct_answer must be 0, 1, 2, or 3")
+
+    explanation_value = raw.get("explanation", "")
+    explanation_hindi = raw.get("explanation_hindi")
+    if explanation_hindi is not None and not isinstance(explanation_value, dict):
+        explanation_value = {"english": explanation_value, "hindi": explanation_hindi}
+    explanation_i18n = _bilingual_value(explanation_value)
+    difficulty = str(raw.get("difficulty", "medium") or "medium").strip().lower()
+    marks = raw.get("marks", raw.get("points", 1))
+    negative_marks = raw.get("negative_marks", 0)
+    try:
+        marks = float(marks)
+        marks = int(marks) if marks.is_integer() else marks
+    except Exception:
+        marks = 1
+    try:
+        negative_marks = float(negative_marks)
+        negative_marks = int(negative_marks) if negative_marks.is_integer() else negative_marks
+    except Exception:
+        negative_marks = 0
+
+    return {
+        "question": question_i18n["english"] or question_i18n["hindi"],
+        "question_hindi": question_i18n["hindi"] or question_i18n["english"],
+        "question_i18n": question_i18n,
+        "question_type": str(raw.get("question_type", "mcq") or "mcq").lower(),
+        "options": english_options,
+        "options_hindi": hindi_options,
+        "options_bilingual": [
+            {"english": english_options[i], "hindi": hindi_options[i]}
+            for i in range(4)
+        ],
+        "correct_answer": correct_answer,
+        "explanation": explanation_i18n["english"],
+        "explanation_hindi": explanation_i18n["hindi"],
+        "explanation_i18n": explanation_i18n,
+        "difficulty": difficulty,
+        "marks": marks,
+        "points": marks,
+        "negative_marks": negative_marks,
+        "is_published": False,
+    }
+
+
+def _validate_bulk_quiz(raw_quiz, quiz_number):
+    if not isinstance(raw_quiz, dict):
+        raise ValueError(f"Quiz {quiz_number}: quiz must be an object")
+    title = str(raw_quiz.get("title", raw_quiz.get("name", "")) or "").strip()
+    if not title:
+        raise ValueError(f"Quiz {quiz_number}: title is required")
+    questions = raw_quiz.get("questions")
+    if not isinstance(questions, list) or not questions:
+        raise ValueError(f"Quiz {quiz_number} ({title}): questions must be a non-empty array")
+
+    normalized_questions = []
+    seen_questions = set()
+    for index, raw_question in enumerate(questions, 1):
+        normalized = _normalize_question(raw_question, index)
+        key = " ".join(normalized["question"].casefold().split())
+        if key in seen_questions:
+            raise ValueError(f"Quiz {quiz_number} ({title}): duplicate question {index} is not allowed")
+        seen_questions.add(key)
+        normalized_questions.append(normalized)
+
+    try:
+        duration = max(1, int(raw_quiz.get("duration_minutes", 25)))
+    except Exception:
+        duration = 25
+    try:
+        passing = min(100, max(0, int(raw_quiz.get("passing_percentage", 60))))
+    except Exception:
+        passing = 60
+    return {
+        "title": title,
+        "subject": str(raw_quiz.get("subject", "Reasoning") or "").strip(),
+        "topic": str(raw_quiz.get("topic", "General") or "").strip(),
+        "description": str(raw_quiz.get("description", "") or "").strip(),
+        "passing_percentage": passing,
+        "duration_minutes": duration,
+        "questions": normalized_questions,
+    }
+
+
+@router.post("/bulk/quiz")
+def bulk_quiz(data: dict | list, user=Depends(admin_user)):
+    """Create at most 50 quiz drafts per request; safe to retry."""
+    if isinstance(data, list):
+        raw_quizzes, batch_number, total_batches = data, 1, 1
+    elif isinstance(data, dict):
+        raw_quizzes = data.get("quizzes", data.get("items", []))
+        batch_number = int(data.get("batch_number", 1) or 1)
+        total_batches = int(data.get("total_batches", 1) or 1)
+    else:
+        raise HTTPException(422, "Bulk quiz payload must be an array or an object containing quizzes")
+
+    if not isinstance(raw_quizzes, list) or not raw_quizzes:
+        raise HTTPException(422, "At least one quiz is required")
+    if len(raw_quizzes) > BULK_QUIZ_BATCH_SIZE:
+        raise HTTPException(422, f"Maximum {BULK_QUIZ_BATCH_SIZE} quizzes are allowed per batch")
+
+    db = get_db()
+    created, skipped, failed = [], [], []
+    for quiz_index, raw_quiz in enumerate(raw_quizzes, 1):
+        try:
+            quiz_data = _validate_bulk_quiz(raw_quiz, quiz_index)
+            title, subject, topic = quiz_data["title"], quiz_data["subject"], quiz_data["topic"]
+            existing = db.quizzes.find_one({"title": title, "subject": subject, "topic": topic})
+            if existing:
+                skipped.append({"index": quiz_index, "title": title, "quiz_id": str(existing.get("_id")), "reason": "Quiz already exists with the same title, subject and topic"})
+                continue
+
+            question_ids = []
+            try:
+                for question in quiz_data["questions"]:
+                    question_doc = make_doc({**question, "subject": subject, "topic": topic}, True)
+                    db.questions.insert_one(question_doc)
+                    question_ids.append(question_doc["_id"])
+
+                quiz_doc = make_doc({
+                "title": title,
+                "name": title,
+                "subject": subject,
+                "topic": topic,
+                "description": quiz_data["description"],
+                "passing_percentage": quiz_data["passing_percentage"],
+                "duration_minutes": quiz_data["duration_minutes"],
+                "max_attempts": 3,
+                "question_ids": question_ids,
+                "question_count": len(question_ids),
+                "is_published": False,
+                "bulk_import": True,
+                "bulk_import_batch": batch_number,
+                "bulk_import_by": str(user.get("_id")),
+                }, True)
+                db.quizzes.insert_one(quiz_doc)
+                created.append({"index": quiz_index, "title": title, "quiz_id": str(quiz_doc["_id"]), "question_count": len(question_ids)})
+            except Exception:
+                # Do not leave orphan questions behind if the quiz document
+                # cannot be written after question validation succeeds.
+                if question_ids:
+                    db.questions.delete_many({"_id": {"$in": question_ids}})
+                raise
+        except Exception as exc:
+            failed.append({"index": quiz_index, "title": str(raw_quiz.get("title", raw_quiz.get("name", ""))) if isinstance(raw_quiz, dict) else "", "error": str(exc)})
+
+    return {
+        "message": f"Batch {batch_number}/{total_batches} processed",
+        "batch_number": batch_number,
+        "total_batches": total_batches,
+        "batch_size": len(raw_quizzes),
+        "created_count": len(created),
+        "skipped_count": len(skipped),
+        "failed_count": len(failed),
+        "created": created,
+        "skipped": skipped,
+        "failed": failed,
+    }
 
 # Students -- explicit endpoints, no generic /users dependency.
 @router.get("/students")
