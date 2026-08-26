@@ -231,77 +231,178 @@ def normalize_quiz_documents(payload, upload_links=None):
     return normalized
 
 
-def create_quiz_drafts(payload, user, upload_links=None):
-    """Validate the complete payload before writing anything to MongoDB."""
-    documents = normalize_quiz_documents(payload, upload_links=upload_links)
-    db = get_db()
-    created = []
+def _quiz_documents_from_payload(payload):
+    """Extract quiz documents without applying the 500-item legacy limit."""
+    if isinstance(payload, dict) and isinstance(payload.get("quizzes"), list):
+        return payload["quizzes"]
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return [payload]
+    raise HTTPException(422, "Quiz JSON must be one quiz object, an array of quiz objects, or an object containing a 'quizzes' array")
 
-    # All validation is completed above before the first insert. This prevents a
-    # malformed topic 17 from being discovered after topics 1-16 were inserted.
-    for document in documents:
-        qids = []
+
+def _insert_quiz_document(document, user, db, *, bulk_upload_id=None, source_index=None):
+    """Insert one already-normalized quiz and its questions safely."""
+    qids = []
+    quiz_id = uuid.uuid4().hex
+    quiz = {
+        "_id": quiz_id,
+        "title": document["title"],
+        "name": document["title"],
+        "description": document["description"],
+        "course_id": document["course_id"],
+        "module_id": document["module_id"],
+        "topic": document["topic"],
+        "subject": document["subject"],
+        "category_ids": document["category_ids"],
+        "categories": document["categories"],
+        "subcategory_ids": document["subcategory_ids"],
+        "subcategories": document["subcategories"],
+        "category": document["category"],
+        "subcategory": document["subcategory"],
+        "quiz_group_key": (document["subject"] + "|" + document["title"]).casefold().strip(),
+        "duration_minutes": document["duration_minutes"],
+        "passing_percentage": document["passing_percentage"],
+        "max_attempts": document["max_attempts"],
+        "question_ids": [],
+        "is_published": False,
+        "created_at": now(),
+        "updated_at": now(),
+        "created_by": uid(user),
+        "bulk_imported": True,
+    }
+    if bulk_upload_id:
+        quiz["bulk_upload_id"] = str(bulk_upload_id)
+        quiz["bulk_source_index"] = int(source_index or document.get("source_index") or 0)
+
+    db.quizzes.insert_one(quiz)
+    try:
         for question in document["questions"]:
             question["created_at"] = now()
             question["created_by"] = uid(user)
             db.questions.insert_one(question)
             qids.append(question["_id"])
+        db.quizzes.update_one({"_id": quiz_id}, {"$set": {"question_ids": qids, "updated_at": now()}})
+        quiz["question_ids"] = qids
+    except Exception:
+        if qids:
+            db.questions.delete_many({"_id": {"$in": qids}})
+        db.quizzes.delete_one({"_id": quiz_id})
+        raise
 
-        quiz_id = uuid.uuid4().hex
-        quiz = {
-            "_id": quiz_id,
-            "title": document["title"],
-            "name": document["title"],
-            "description": document["description"],
-            "course_id": document["course_id"],
-            "module_id": document["module_id"],
-            "topic": document["topic"],
-            "subject": document["subject"],
-            "category_ids": document["category_ids"],
-            "categories": document["categories"],
-            "subcategory_ids": document["subcategory_ids"],
-            "subcategories": document["subcategories"],
-            "category": document["category"],
-            "subcategory": document["subcategory"],
-            "quiz_group_key": (document["subject"] + "|" + document["title"]).casefold().strip(),
-            "duration_minutes": document["duration_minutes"],
-            "passing_percentage": document["passing_percentage"],
-            "max_attempts": document["max_attempts"],
-            "question_ids": qids,
-            "category": document["category"],
-            "is_published": False,
-            "created_at": now(),
-            "updated_at": now(),
-            "created_by": uid(user),
-            "bulk_imported": True,
-        }
-        db.quizzes.insert_one(quiz)
+    return quiz, len(qids)
+
+
+def create_quiz_batch(payload, user, upload_links=None, *, bulk_upload_id=None):
+    """Process at most 50 quizzes and return per-quiz results.
+
+    This endpoint is deliberately batch-sized so the frontend can process files
+    containing hundreds or thousands of quizzes without sending a huge request.
+    A bulk upload id/source index makes a retried batch idempotent.
+    """
+    documents = _quiz_documents_from_payload(payload)
+    if not documents:
+        raise HTTPException(422, "At least one quiz is required")
+    if len(documents) > 50:
+        raise HTTPException(413, "A quiz batch can contain at most 50 quizzes")
+
+    if upload_links is None:
+        upload_links = resolve_upload_links(payload)
+
+    db = get_db()
+    created = []
+    skipped = []
+    failed = []
+    seen_titles = set()
+
+    for local_index, raw in enumerate(documents, 1):
+        source_index = raw.get("_bulk_source_index", local_index) if isinstance(raw, dict) else local_index
+        title_hint = str(raw.get("title", raw.get("name", ""))).strip() if isinstance(raw, dict) else ""
+        try:
+            if not isinstance(raw, dict):
+                raise HTTPException(422, f"Quiz {local_index} must be a JSON object")
+
+            title_key = title_hint.casefold()
+            if title_key and title_key in seen_titles:
+                raise HTTPException(422, f"Quiz {local_index}: duplicate quiz title '{title_hint}' in this batch")
+            if title_key:
+                seen_titles.add(title_key)
+
+            if bulk_upload_id:
+                existing = db.quizzes.find_one({
+                    "bulk_upload_id": str(bulk_upload_id),
+                    "bulk_source_index": int(source_index),
+                })
+                if existing:
+                    skipped.append({
+                        "source_index": int(source_index),
+                        "title": existing.get("title") or title_hint,
+                        "reason": "Already processed in this bulk upload.",
+                        "quiz_id": str(existing.get("_id")),
+                    })
+                    continue
+
+            # Add the original absolute index so a retry of batch N cannot
+            # accidentally create the same quiz twice.
+            raw_with_index = dict(raw)
+            raw_with_index["_bulk_source_index"] = int(source_index)
+            normalized = normalize_quiz_documents([raw_with_index], upload_links=upload_links)[0]
+            quiz, question_count = _insert_quiz_document(
+                normalized, user, db, bulk_upload_id=bulk_upload_id, source_index=source_index
+            )
+            created.append({
+                "quiz": clean(quiz),
+                "question_count": question_count,
+                "source_index": int(source_index),
+                "topic": normalized["topic"],
+            })
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            failed.append({"source_index": int(source_index), "title": title_hint, "error": detail})
+        except Exception as exc:
+            logger = __import__("logging").getLogger("smart_learning_lab.api.bulk")
+            logger.exception("BULK_QUIZ_ITEM_FAILED | source_index=%s | title=%s", source_index, title_hint)
+            failed.append({"source_index": int(source_index), "title": title_hint, "error": "Unexpected database error while creating this quiz."})
+
+    total_questions = sum(x["question_count"] for x in created)
+    return {
+        "status": "completed",
+        "batch_size": len(documents),
+        "created_count": len(created),
+        "skipped_count": len(skipped),
+        "failed_count": len(failed),
+        "created_quizzes": created,
+        "skipped_quizzes": skipped,
+        "failed_quizzes": failed,
+        "quiz_count": len(created),
+        "question_count": total_questions,
+        "message": f"Batch completed: {len(created)} created, {len(skipped)} skipped, {len(failed)} failed.",
+    }
+
+
+def create_quiz_drafts(payload, user, upload_links=None):
+    """Legacy bulk endpoint. It remains compatible and supports up to 500 quizzes."""
+    documents = normalize_quiz_documents(payload, upload_links=upload_links)
+    db = get_db()
+    created = []
+    for document in documents:
+        quiz, question_count = _insert_quiz_document(document, user, db)
         created.append({
             "quiz": clean(quiz),
-            "question_count": len(qids),
+            "question_count": question_count,
             "source_index": document["source_index"],
             "topic": document["topic"],
         })
 
     total_questions = sum(x["question_count"] for x in created)
-    if len(created) == 1:
-        return {
-            "quiz": created[0]["quiz"],
-            "quizzes": [created[0]["quiz"]],
-            "created_quizzes": created,
-            "quiz_count": 1,
-            "question_count": total_questions,
-            "total_question_count": total_questions,
-            "message": "1 quiz draft created. Review it in Test Series before publishing.",
-        }
-
     return {
         "quizzes": [x["quiz"] for x in created],
         "created_quizzes": created,
         "quiz_count": len(created),
         "question_count": total_questions,
         "total_question_count": total_questions,
-        "message": f"{len(created)} quiz drafts created — one quiz for each topic in the uploaded JSON. Review them in Test Series before publishing.",
+        "message": f"{len(created)} quiz draft(s) created. Review them in Test Series before publishing.",
     }
 
 
@@ -310,6 +411,24 @@ def bulk_quiz(data: object = Body(...), user=Depends(admin_user)):
     # The FE sends taxonomy once at the upload level and the backend applies it
     # to every quiz in the request. Individual quiz category fields are ignored.
     return create_quiz_drafts(data, user)
+
+
+@router.post("/quiz-batch")
+def bulk_quiz_batch(data: object = Body(...), user=Depends(admin_user)):
+    """Create one frontend batch of at most 50 quizzes.
+
+    The frontend is responsible for splitting a large JSON file into 50-item
+    batches. This endpoint returns per-item failures instead of failing the
+    whole batch, so one malformed quiz cannot stop the remaining 49.
+    """
+    if not isinstance(data, dict):
+        raise HTTPException(422, "Batch payload must be a JSON object")
+    upload_links = resolve_upload_links(data)
+    bulk_upload_id = data.get("bulk_upload_id")
+    quizzes = data.get("quizzes")
+    if not isinstance(quizzes, list):
+        raise HTTPException(422, "Batch payload must contain a 'quizzes' array")
+    return create_quiz_batch(quizzes, user, upload_links=upload_links, bulk_upload_id=bulk_upload_id)
 
 
 @router.post("/quiz-file")

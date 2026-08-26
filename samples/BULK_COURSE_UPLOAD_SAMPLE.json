@@ -1,0 +1,9 @@
+{
+  "pdf_file": "complete_english_grammar.pdf",
+  "title": "Complete English Grammar",
+  "subject": "English",
+  "level": "Beginner",
+  "language": "English",
+  "category_ids": ["ssc"],
+  "subcategory_ids": ["ssc:ssc-cgl"]
+}

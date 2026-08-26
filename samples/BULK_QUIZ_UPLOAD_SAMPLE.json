@@ -1,0 +1,50 @@
+[
+  {
+    "title": "English Grammar - Noun - Set 1",
+    "subject": "English",
+    "topic": "Noun",
+    "description": "Medium practice test on Nouns",
+    "passing_percentage": 60,
+    "duration_minutes": 20,
+    "max_attempts": 3,
+    "questions": [
+      {
+        "question": "Which of the following is a proper noun?",
+        "options": ["city", "country", "Delhi", "river"],
+        "correct_answer": 2,
+        "difficulty": "medium",
+        "marks": 1,
+        "negative_marks": 0,
+        "explanation": "Delhi is the specific name of a city, so it is a proper noun."
+      },
+      {
+        "question": "Which sentence contains an abstract noun?",
+        "options": ["The child opened the door.", "Her honesty impressed everyone.", "The farmer watered the field.", "The bird built a nest."],
+        "correct_answer": 1,
+        "difficulty": "medium",
+        "marks": 1,
+        "negative_marks": 0,
+        "explanation": "Honesty names a quality rather than a physical object."
+      }
+    ]
+  },
+  {
+    "title": "English Grammar - Pronoun - Set 1",
+    "subject": "English",
+    "topic": "Pronoun",
+    "description": "Medium practice test on Pronouns",
+    "passing_percentage": 60,
+    "duration_minutes": 20,
+    "questions": [
+      {
+        "question": "Choose the correct relative pronoun: The candidate ___ application was rejected appealed to the board.",
+        "options": ["who", "whom", "whose", "which"],
+        "correct_answer": 2,
+        "difficulty": "medium",
+        "marks": 1,
+        "negative_marks": 0,
+        "explanation": "Whose expresses possession and modifies application."
+      }
+    ]
+  }
+]
