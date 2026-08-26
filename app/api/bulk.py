@@ -66,50 +66,142 @@ def resolve_upload_links(payload=None, *, category_ids=None, categories=None, su
     return resolve_links(category_ids, categories, subcategory_ids, subcategories)
 
 
+def _i18n_text(value, language="english"):
+    """Return a language-specific string from a plain string or i18n object."""
+    if isinstance(value, dict):
+        keys = ("english", "en") if language == "english" else ("hindi", "hi")
+        for key in keys:
+            if value.get(key) is not None:
+                return str(value[key]).strip()
+        # Graceful fallback when only the other language is supplied.
+        for key in ("english", "en", "hindi", "hi"):
+            if value.get(key) is not None:
+                return str(value[key]).strip()
+        return ""
+    return str(value or "").strip()
+
+
+def _normalize_bulk_options(q):
+    """Normalize all supported single-language/bilingual option schemas."""
+    options = q.get("options")
+    english = []
+    hindi = []
+
+    if isinstance(options, dict):
+        english = options.get("english") or options.get("en") or []
+        hindi = options.get("hindi") or options.get("hi") or []
+    elif isinstance(options, list):
+        english = options
+
+    if isinstance(q.get("options_hindi"), list):
+        hindi = q["options_hindi"]
+
+    paired = q.get("options_bilingual")
+    if isinstance(paired, list) and paired:
+        english = [_i18n_text(x, "english") for x in paired]
+        hindi = [_i18n_text(x, "hindi") for x in paired]
+
+    english = list(english or [])
+    hindi = list(hindi or [])
+
+    # A single-language upload remains valid. For consistent student rendering,
+    # mirror the available language into the missing language.
+    if not english and hindi:
+        english = list(hindi)
+    if not hindi and english:
+        hindi = list(english)
+
+    return [str(x).strip() for x in english], [str(x).strip() for x in hindi]
+
+
+def _resolve_bulk_answer(value, english_options, hindi_options):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+
+    text = str(value or "").strip()
+    if len(text) == 1 and text.upper() in "ABCD":
+        return ord(text.upper()) - ord("A")
+
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        pass
+
+    lowered = text.casefold()
+    for index, option in enumerate(english_options):
+        if option.casefold() == lowered:
+            return index
+    for index, option in enumerate(hindi_options):
+        if option.casefold() == lowered:
+            return index
+    return -1
+
+
 def validate_questions(questions):
+    """Validate and normalize single-language or bilingual MCQ questions.
+
+    Accepted formats:
+      - question: string; options: ["A", "B", "C", "D"]
+      - question: {english: "...", hindi: "..."}
+        options: {english: [...], hindi: [...]}
+      - question_hindi + options_hindi legacy fields
+      - options_bilingual: [{english: "...", hindi: "..."}]
+    """
     if not isinstance(questions, list) or not questions:
         raise HTTPException(422, "At least one question is required")
 
     out = []
+    seen_questions = set()
+
     for i, q in enumerate(questions, 1):
         if not isinstance(q, dict):
             raise HTTPException(422, f"Question {i} must be a JSON object")
 
-        question = str(q.get("question", "")).strip()
-        options = q.get("options")
+        english_question = _i18n_text(q.get("question"), "english")
+        hindi_question = _i18n_text(q.get("question"), "hindi")
+        if q.get("question_hindi") is not None:
+            hindi_question = _i18n_text(q.get("question_hindi"), "hindi") or hindi_question
 
-        if not question:
+        if not english_question and not hindi_question:
             raise HTTPException(422, f"Question {i}: question text is empty")
-        if not isinstance(options, list) or len(options) < 2:
-            raise HTTPException(422, f"Question {i}: provide at least two options")
 
-        normalized_options = [str(x).strip() for x in options]
-        if any(not x for x in normalized_options):
+        english_options, hindi_options = _normalize_bulk_options(q)
+
+        if len(english_options) != 4 or len(hindi_options) != 4:
+            raise HTTPException(422, f"Question {i}: exactly four options are required")
+
+        if any(not x for x in english_options + hindi_options):
             raise HTTPException(422, f"Question {i}: options cannot be empty")
-        if len(set(x.casefold() for x in normalized_options)) != len(normalized_options):
-            raise HTTPException(422, f"Question {i}: duplicate options are not allowed")
 
-        correct = q.get("correct_answer", q.get("answer", 0))
-        if isinstance(correct, str):
-            c = correct.strip()
-            # Support A/B/C/D, option text, and numeric strings.
-            if len(c) == 1 and c.upper() in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-                correct = ord(c.upper()) - 65
-            elif c in normalized_options:
-                correct = normalized_options.index(c)
-            else:
-                try:
-                    correct = int(c)
-                except Exception:
-                    raise HTTPException(422, f"Question {i}: invalid correct_answer '{c}'")
+        def has_duplicates(values):
+            normalized = [" ".join(x.casefold().split()) for x in values]
+            return len(normalized) != len(set(normalized))
 
-        try:
-            correct = int(correct)
-        except Exception:
-            raise HTTPException(422, f"Question {i}: correct_answer must be a zero-based option index")
+        if has_duplicates(english_options):
+            raise HTTPException(422, f"Question {i}: duplicate English options are not allowed")
+        if has_duplicates(hindi_options):
+            raise HTTPException(422, f"Question {i}: duplicate Hindi options are not allowed")
 
-        if not 0 <= correct < len(normalized_options):
-            raise HTTPException(422, f"Question {i}: correct_answer {correct} is outside options 0-{len(normalized_options)-1}")
+        correct = _resolve_bulk_answer(
+            q.get("correct_answer", q.get("answer", 0)),
+            english_options,
+            hindi_options,
+        )
+        if correct not in range(4):
+            raise HTTPException(422, f"Question {i}: correct_answer must be 0, 1, 2, 3, A, B, C or D")
+
+        question_key = " ".join((english_question or hindi_question).casefold().split())
+        if question_key in seen_questions:
+            raise HTTPException(422, f"Question {i}: duplicate question is not allowed")
+        seen_questions.add(question_key)
+
+        explanation = q.get("explanation", "")
+        explanation_english = _i18n_text(explanation, "english")
+        explanation_hindi = _i18n_text(explanation, "hindi")
+        if q.get("explanation_hindi") is not None:
+            explanation_hindi = _i18n_text(q.get("explanation_hindi"), "hindi") or explanation_hindi
 
         try:
             marks = int(q.get("marks", 1) or 1)
@@ -127,18 +219,34 @@ def validate_questions(questions):
 
         out.append({
             "_id": uuid.uuid4().hex,
-            "question": question,
+            "question": english_question or hindi_question,
+            "question_hindi": hindi_question or english_question,
+            "question_i18n": {
+                "english": english_question or hindi_question,
+                "hindi": hindi_question or english_question,
+            },
             "question_type": str(q.get("question_type", "mcq")),
-            "options": normalized_options,
+            "options": english_options,
+            "options_hindi": hindi_options,
+            "options_bilingual": [
+                {"english": english_options[index], "hindi": hindi_options[index]}
+                for index in range(4)
+            ],
             "correct_answer": correct,
             "answer": correct,
             "difficulty": difficulty,
             "marks": max(1, marks),
             "negative_marks": max(0, negative_marks),
-            "explanation": str(q.get("explanation", "")).strip(),
+            "explanation": explanation_english or explanation_hindi,
+            "explanation_hindi": explanation_hindi or explanation_english,
+            "explanation_i18n": {
+                "english": explanation_english or explanation_hindi,
+                "hindi": explanation_hindi or explanation_english,
+            },
             "tags": tags,
             "is_published": False,
         })
+
     return out
 
 def normalize_quiz_documents(payload, upload_links=None):
@@ -348,6 +456,23 @@ def create_quiz_batch(payload, user, upload_links=None, *, bulk_upload_id=None):
             raw_with_index = dict(raw)
             raw_with_index["_bulk_source_index"] = int(source_index)
             normalized = normalize_quiz_documents([raw_with_index], upload_links=upload_links)[0]
+
+            # Protect against duplicates even when the same JSON is uploaded
+            # again with a new bulk_upload_id.
+            existing_by_identity = db.quizzes.find_one({
+                "title": normalized["title"],
+                "subject": normalized["subject"],
+                "topic": normalized["topic"],
+            })
+            if existing_by_identity:
+                skipped.append({
+                    "source_index": int(source_index),
+                    "title": normalized["title"],
+                    "reason": "Quiz already exists with the same title, subject and topic.",
+                    "quiz_id": str(existing_by_identity.get("_id")),
+                })
+                continue
+
             quiz, question_count = _insert_quiz_document(
                 normalized, user, db, bulk_upload_id=bulk_upload_id, source_index=source_index
             )
