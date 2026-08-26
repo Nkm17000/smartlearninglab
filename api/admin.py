@@ -3,6 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.security import admin_user, root_admin_user, hash_password
 from app.db.mongo import get_db
+from app.services.taxonomy import all_taxonomy
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
 
@@ -69,6 +70,15 @@ def delete_doc(collection, item_id):
     return {"message": "Deleted", "id": str(old["_id"])}
 
 # Dashboard
+@router.get("/taxonomy")
+def admin_taxonomy(user=Depends(admin_user)):
+    """Return the full category/subcategory taxonomy used by admin content forms.
+
+    The endpoint is intentionally backed by the same taxonomy service used by
+    bulk uploads, courses, quizzes, and the admin taxonomy screen.
+    """
+    return {"categories": all_taxonomy()}
+
 @router.get("/dashboard")
 def dashboard(user=Depends(admin_user)):
     db = get_db()
