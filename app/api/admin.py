@@ -319,6 +319,64 @@ def create_quiz(data: dict, user=Depends(admin_user)):
     d.setdefault("is_published", False)
     return create_doc("quizzes", d, True)
 
+@router.post("/quizzes/publish-all")
+def publish_all_quizzes(user=Depends(admin_user)):
+    """Publish all draft quizzes that contain valid question references.
+
+    This endpoint is database-wide; it does not depend on the currently
+    filtered/paginated list shown in the admin UI. Invalid or empty quizzes
+    are skipped and reported instead of causing the whole operation to fail.
+    """
+    db = get_db()
+    drafts = list(db.quizzes.find({"is_published": {"$ne": True}}))
+
+    published_count = 0
+    skipped = []
+
+    for quiz_doc in drafts:
+        quiz_id = str(quiz_doc.get("_id"))
+        title = quiz_doc.get("title") or quiz_doc.get("name") or "Untitled Quiz"
+        question_ids = list(quiz_doc.get("question_ids") or [])
+
+        if not question_ids:
+            skipped.append({
+                "id": quiz_id,
+                "title": title,
+                "reason": "No questions attached",
+            })
+            continue
+
+        missing = []
+        for qid in question_ids:
+            if not find_by_id("questions", str(qid)):
+                missing.append(str(qid))
+
+        if missing:
+            skipped.append({
+                "id": quiz_id,
+                "title": title,
+                "reason": f"Missing question(s): {', '.join(missing)}",
+            })
+            continue
+
+        update_doc(
+            "quizzes",
+            quiz_id,
+            {
+                "is_published": True,
+                "published_at": now(),
+            },
+        )
+        published_count += 1
+
+    return {
+        "message": f"Published {published_count} quiz(es).",
+        "published_count": published_count,
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+    }
+
+
 @router.get("/quizzes/{quiz_id}")
 def quiz(quiz_id: str, user=Depends(admin_user)):
     x = find_by_id("quizzes", quiz_id)
@@ -335,7 +393,14 @@ def delete_quiz(quiz_id: str, user=Depends(admin_user)):
 
 @router.post("/quizzes/{quiz_id}/publish")
 def publish_quiz(quiz_id: str, user=Depends(admin_user)):
-    return update_doc("quizzes", quiz_id, {"is_published": True})
+    return update_doc(
+        "quizzes",
+        quiz_id,
+        {
+            "is_published": True,
+            "published_at": now(),
+        },
+    )
 
 @router.post("/quizzes/{quiz_id}/unpublish")
 def unpublish_quiz(quiz_id: str, user=Depends(admin_user)):
